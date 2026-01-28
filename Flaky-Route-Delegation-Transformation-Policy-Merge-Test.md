@@ -80,8 +80,104 @@ spec:
       port: 8080
 ```
 
+# PARENT POLICY (applied at hostname level)
+apiVersion: networking.kgateway.io/v1
+kind: TrafficPolicy
+metadata:
+  name: parent-policy
+spec:
+  targetRefs:
+  - kind: HTTPRoute
+    name: parent-route
+  http:
+    response:
+      addHeaders:
+      - name: "origin"
+        value: "parent1"
+      - name: "environment"
+        value: "production"
+
+---
+
+# CHILD POLICY (applied at path level)
+apiVersion: networking.kgateway.io/v1
+kind: TrafficPolicy
+metadata:
+  name: child-policy
+spec:
+  targetRefs:
+  - kind: HTTPRoute
+    name: child-route
+  http:
+    response:
+      addHeaders:
+      - name: "origin"
+        value: "svc1"
+      - name: "service"
+        value: "user-service"
+
+---
+
+### What is Shallow merge vs Deep merge
+
+It is basically a field in manifests  `mergeStrategy: DeepMerge`
+
+Shallow means if the child has something, it COMPLETELY REPLACES the parent's version. Deep merge on the other hand checks each field, and choses the child one if they have conflict, otherwise, it chooses everything from parent.
+
+```
+# PARENT POLICY with DeepMerge strategy
+apiVersion: networking.kgateway.io/v1
+kind: TrafficPolicy
+metadata:
+  name: parent-policy
+  namespace: default
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: parent-route
+  # THIS is where you specify the merge strategy!
+  mergeStrategy: DeepMerge    # ← MERGE STRATEGY SPECIFIED HERE
+  http:
+    response:
+      addHeaders:
+      - name: "origin"
+        value: "parent1"
+      - name: "environment"
+        value: "production"
+
+---
+
+# CHILD POLICY with ShallowMerge strategy
+apiVersion: networking.kgateway.io/v1
+kind: TrafficPolicy
+metadata:
+  name: child-policy
+  namespace: default
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: child-route
+  # THIS is where you specify the merge strategy!
+  mergeStrategy: ShallowMerge   # ← MERGE STRATEGY SPECIFIED HERE
+  http:
+    response:
+      addHeaders:
+      - name: "origin"
+        value: "svc1"
+      - name: "service"
+        value: "user-service"
+```
+
+ShallowMerge:
+- origin: svc1              (from child)
+- service: user-service     (from child)
 
 
+DeepMerge:
+- origin: svc1              (child's value overrides parent's)
+- environment: production   (from parent - no conflict, so included)
 
 
 
