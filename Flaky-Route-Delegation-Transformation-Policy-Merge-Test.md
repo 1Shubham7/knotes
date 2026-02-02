@@ -80,6 +80,7 @@ spec:
       port: 8080
 ```
 
+```
 # PARENT POLICY (applied at hostname level)
 apiVersion: networking.kgateway.io/v1
 kind: TrafficPolicy
@@ -117,7 +118,7 @@ spec:
         value: "user-service"
 
 ---
-
+```
 ### What is Shallow merge vs Deep merge
 
 It is basically a field in manifests  `mergeStrategy: DeepMerge`
@@ -179,9 +180,9 @@ DeepMerge:
 - origin: svc1              (child's value overrides parent's)
 - environment: production   (from parent - no conflict, so included)
 
+#### RustFormation
 
-
-
+RustFormation is a module that uses native Envoy per-route config Kgateway for transforming traffic. it is a transformation engine written in Rust. It's more powerful and works at a more granular level (can merge at the "set", "add", and "remove" level for headers) . This is the one that  exposes the bug we are seeing.
 
 
 
