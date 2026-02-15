@@ -184,17 +184,116 @@ DeepMerge:
 
 RustFormation is a module that uses native Envoy per-route config Kgateway for transforming traffic. it is a transformation engine written in Rust. It's more powerful and works at a more granular level (can merge at the "set", "add", and "remove" level for headers) . This is the one that  exposes the bug we are seeing.
 
+---
 
+# ISSUE
 
+## Test Setup
+Problem is with TestPolicyMerging (its being skipped right now), this is how the test setup is:
 
+- two websites (`parent1.com` and `parent2.com`) share the same backend teams (`team1` and `team2`)
+- Each website has its own rules about whose policy should win when there's a conflict.
 
+we are trying to do something like :
 
+```
+Parent Route (platform team owns):
+  "If the host is parent1.com and path starts with /anything/*, delegate to child routes"
 
+Child Route (team1 owns):
+  "If path starts with /anything/team1, route to my-service-1"
 
+Child Route (team2 owns):  
+  "If path starts with /anything/team2, route to my-service-2"
+```
 
+These are the manifests:
 
+- Parent 1
 
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: parent1
+  namespace: infra
+  annotations:
+    kgateway.dev/inherited-policy-priority: DeepMergePreferChild  # we will prefer child
+spec:
+  hostnames:
+  - parent1.com                        # only matches requests to this host
+  parentRefs:
+  - name: http-gateway                 # Attached to the Gateway
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /anything               # Matches any path starting with /anything
+    backendRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: svc1                       # Delegates to child route "svc1"
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: svc2                       # Delegates to child route "svc2"
+```
 
+what this does is - When someone sends a request to `parent1.com/anything/*`, this route catches it and says "I'm not going to handle this myself — let my child routes (`svc1` and `svc2`) handle the specific sub-paths."
 
+- Parent 2:
 
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: parent2
+  namespace: infra
+  annotations:
+    kgateway.dev/inherited-policy-priority: DeepMergePreferParent  # we will prefer parent
+spec:
+  hostnames:
+  - parent2.com
+  parentRefs:
+  - name: http-gateway
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /anything
+    backendRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: svc1
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: svc2
+```
 
+- Chile 1
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: svc1
+  namespace: infra
+spec:
+  parentRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: parent1                      #  it is a child of both parent 1 and 2
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: parent2
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /anything/team1         #  it will delegate /team1 to httpbin
+    backendRefs:
+    - name: httpbin
+```
+
+This route handles `/anything/team1` requests. 
+
+same goes for child 2,  `svc2` it matchs `/anything/team2` 
