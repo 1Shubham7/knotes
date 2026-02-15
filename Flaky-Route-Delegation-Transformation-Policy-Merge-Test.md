@@ -297,3 +297,79 @@ spec:
 This route handles `/anything/team1` requests. 
 
 same goes for child 2,  `svc2` it matchs `/anything/team2` 
+
+- TrafficPolicy on `parent2`
+
+```yaml
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: tp-parent2
+  namespace: infra
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: parent2
+  transformation:
+    response:
+      set:
+      - name: origin
+        value: parent2                 # in response it sets "origin" header to "parent2"
+```
+
+This policy says "for any request handled by `parent2`, set a response header `origin: parent2`."
+And IMP -  There is **no** TrafficPolicy on `parent1`.
+
+- TrafficPolicy on `svc1`
+
+```yaml
+apiVersion: gateway.kgateway.dev/v1alpha1
+kind: TrafficPolicy
+metadata:
+  name: tp-svc1
+  namespace: infra
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: HTTPRoute
+    name: svc1           
+  transformation:
+    response:
+      set:
+      - name: origin
+        value: svc1                    #  Set "origin" header to "svc1"
+```
+
+and same for svc2 , just set header `origin: svc2`.
+
+
+### What happens:
+
+Request: `curl -H "host: parent1.com" http://gateway:8080/anything/team1/foo`
+
+1. Gateway receives req
+2. Host is "parent1.com" -> matches parent1 route
+3. parent1 delegates to svc1 and svc2
+4. Path starts with "/anything/team1" -> matches svc1's rule
+5. Traffic goes to httpbin service
+
+Policy merge:
+  - svc1 has: origin=svc1
+  - parent1 has: nothing (no TrafficPolicy on parent1)
+  - parent1 annotation: DeepMergePreferChild -> child wins
+  - Result: origin=svc1
+
+Request: `curl -H "host: parent2.com" http://gateway:8080/anything/team1/foo`
+
+1. Gateway receives request on port 8080
+2. Host is "parent2.com" -> matches parent2 route
+3. parent2 delegates to svc1 and svc2
+4. Path starts with "/anything/team1" -> matches svc1's rule
+6. Traffic goes to httpbin service
+
+Policy merge:
+  - svc1 has: origin=svc1    (child policy)
+  - parent2 has: origin=parent2  (parent policy)
+  - parent2 annotation: DeepMergePreferParent
+  - Result: origin=parent2
