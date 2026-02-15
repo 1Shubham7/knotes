@@ -373,3 +373,46 @@ Policy merge:
   - parent2 has: origin=parent2  (parent policy)
   - parent2 annotation: DeepMergePreferParent
   - Result: origin=parent2
+
+These are the expected results:
+
+| url | merge  | who won | expected origin header |
+|---|---|---|---|
+| `parent1.com/anything/team1` | `DeepMergePreferChild` | child wins | `svc1` |
+| `parent1.com/anything/team2` | `DeepMergePreferChild` | child wins | `svc2` |
+| `parent2.com/anything/team1` | `DeepMergePreferParent` | parent wins | `parent2` |
+| `parent2.com/anything/team2` | `DeepMergePreferParent` | parent wins | `parent2` |
+
+---
+
+ACtual Behavior:
+
+Results are non-deterministic. sometimes `parent2.com/anything/team1` returns `origin: svc1` instead of `origin: parent2`, or vice versa.
+
+# Bug (I think I got it)
+
+```go
+func (a *AttachedPolicies) AppendWithPriority(HierarchicalPriority int, l ...AttachedPolicies) {
+    for _, l := range l {
+        for k, v := range l.Policies {
+            for j := range v {
+                v[j].HierarchicalPriority = HierarchicalPriority  // <- this line
+            }
+            a.Policies[k] = append(a.Policies[k], v...)
+        }
+    }
+}
+```
+
+we are updating the `v[j].HierarchicalPriority` in place , so it changes the data for any other delegation chain that reads from the same slice.
+
+`for k, v := range l.Policies {` - v here is a copy of the slice header (pointer + len + cap), but the underlying array is shared.
+
+```
+for j := range v {
+    v[j].HierarchicalPriority = HierarchicalPriority  // ← mutates shared array
+}
+```
+
+v[j] indexes into the underlying array directly - updating this stuff affect the original data.
+
