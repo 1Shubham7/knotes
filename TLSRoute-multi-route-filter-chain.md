@@ -171,3 +171,6 @@ yamlfilter_chain_match:
 ```
 
 So bar.example.com traffic never gets routed. Silently broken again. The fix is simple — put all hostnames in one filter chain:
+
+### TCP vs TLS routes
+
