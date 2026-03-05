@@ -142,7 +142,7 @@ The Gateway Inference Extension (GIE) is the entire system that adds AI-awarenes
 └─────────────────────────────────────────────┘
 ```
 
-## 1. The Big Picture
+## Project goal
 
 using EPP means that  every single inference request takes an **extra round-trip** - the request goes to Envoy, Envoy forwards it to the EPP over gRPC, the EPP thinks and responds, and then Envoy routes to the actual model pod.
 
@@ -151,7 +151,7 @@ using EPP means that  every single inference request takes an **extra round-trip
 - goal is to have tests that create report that says: *"With inference routing enabled, p99 latency increased by X ms, throughput decreased by Y%, and the EPP uses Z millicores of CPU"*
 - Compare results across kgateway versions to catch regressions
 
-## 2. Understanding the kgateway Data Plane
+## kgateway Data Plane
 
 Envoy Is the Data Plane, kgateway is a **control plane** - it does not actually handle your HTTP requests.
 
@@ -178,11 +178,8 @@ Envoy  ← handles 100% of traffic directly
 vLLM Backend Pod
 ```
 
-kgateway reads your Kubernetes resources (Gateway, HTTPRoute, InferencePool) and translates them into Envoy configuration, which it pushes to Envoy via the xDS protocol. Envoy then uses that configuration to route requests.
-
-**For benchmarking, this means:**
-- We are benchmarking **Envoy** (the data plane), not the kgateway controller
-- The controller does its work before requests arrive; we are measuring request-time cost
+- We are benchmarking Envoy, not the kgateway controller
+- The controller does its work before requests arrive, we are measuring request-time cost
 
 ### The Translation Pipeline
 
