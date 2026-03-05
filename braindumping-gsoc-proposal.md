@@ -144,42 +144,38 @@ The Gateway Inference Extension (GIE) is the entire system that adds AI-awarenes
 
 ## 1. The Big Picture
 
-### The Problem We Are Solving
+using EPP means that  every single inference request takes an **extra round-trip** - the request goes to Envoy, Envoy forwards it to the EPP over gRPC, the EPP thinks and responds, and then Envoy routes to the actual model pod.
 
-kgateway already does something important — it routes AI inference traffic from clients to model servers running inside Kubernetes (things like vLLM). The part that does the "smart routing" is a component called the **Endpoint Picker (EPP)**. The EPP is an external process that is called by Envoy (via the `ext_proc` filter) every time a request arrives, so it can decide: *which specific pod should handle this request?*
+**we need to measure how much this costs.** How many milliseconds does the EPP add to each request? Does it get slower under high load? Does it eat a lot of CPU and memory?
 
-The EPP is doing something clever. Instead of simple round-robin, it looks at:
-- Which pods have the query's context already cached in their GPU memory? (KV-cache awareness)
-- Which pods have the right LoRA adapter loaded? (LoRA awareness)
-- Which pods are too busy? (queue depth awareness)
-
-This is smart, but it means every single inference request takes an **extra round-trip** — the request goes to Envoy, Envoy forwards it to the EPP over gRPC, the EPP thinks and responds, and then Envoy routes to the actual model pod.
-
-**The problem is: nobody has measured how much this costs.** How many milliseconds does the EPP add to each request? Does it get slower under high load? Does it eat a lot of CPU and memory? Nobody knows. That is what this project measures.
-
-### The End Goal
-
-By the end of 6 weeks, someone should be able to:
-1. Run `make benchmark-inference` on their laptop with a Kind cluster
-2. Get a report that says: *"With inference routing enabled, p99 latency increased by X ms, throughput decreased by Y%, and the EPP uses Z millicores of CPU"*
-3. Compare results across kgateway versions to catch regressions
-
----
+- goal is to have tests that create report that says: *"With inference routing enabled, p99 latency increased by X ms, throughput decreased by Y%, and the EPP uses Z millicores of CPU"*
+- Compare results across kgateway versions to catch regressions
 
 ## 2. Understanding the kgateway Data Plane
 
-Before we can understand what we are measuring, we need to understand how kgateway works.
+Envoy Is the Data Plane, kgateway is a **control plane** - it does not actually handle your HTTP requests.
 
-### Envoy Is the Data Plane
+This happens before any requests:
 
-kgateway is a **control plane** — it does not actually handle your HTTP requests. Instead, it manages **Envoy proxy**, which is the thing that actually touches your packets.
+```
+Kubernetes API (CRDs) 
+        ↓
+    kgateway controller reads them
+        ↓
+    kgateway translates to xDS config
+        ↓
+    pushes xDS config to Envoy
+```
 
-```mermaid
-flowchart LR
-    Client["Client"] -->|"HTTP Request"| Envoy["Envoy Proxy\n(data plane)"]
-    Envoy -->|"xDS config"| KGW["kgateway controller\n(control plane)"]
-    KGW -.->|"reads"| K8s["Kubernetes API\n(Gateways, HTTPRoutes,\nInferencePools...)"]
-    Envoy -->|"forward request"| Backend["Backend Pod\n(model server)"]
+and during runtime, when client sends req:
+```
+Client
+  ↓
+Envoy  ← handles 100% of traffic directly
+  ↓
+(EPP if InferencePool attached)
+  ↓
+vLLM Backend Pod
 ```
 
 kgateway reads your Kubernetes resources (Gateway, HTTPRoute, InferencePool) and translates them into Envoy configuration, which it pushes to Envoy via the xDS protocol. Envoy then uses that configuration to route requests.
