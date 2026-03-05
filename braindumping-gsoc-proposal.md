@@ -188,20 +188,18 @@ When you apply an InferencePool to your cluster, kgateway goes through three pha
 ```mermaid
 flowchart LR
     P["InferencePool CRD\n(Kubernetes)"]
-    IR1["Policy IR\n(Go struct, close\nto Envoy protos)"]
-    IR2["Gateway IR\n(Routes + attached\nInferencePool)"]
-    XDS["Envoy xDS Config\n(ext_proc filter,\nclusters, routes)"]
+    IR1["Policy IR (Go struct, close\nto Envoy protos)"]
+    IR2["Gateway IR (Routes + attached\nInferencePool)"]
+    XDS["Envoy xDS Config (ext_proc filter,\nclusters, routes)"]
 
-    P -->|"Phase 1:\nPlugin translates CRD"| IR1
-    IR1 -->|"Phase 2:\nPolicy attached to route"| IR2
-    IR2 -->|"Phase 3:\nTranslate to Envoy config"| XDS
+    P -->|"Phase 1: Plugin translates CRD"| IR1
+    IR1 -->|"Phase 2: Policy attached to route"| IR2
+    IR2 -->|"Phase 3: Translate to Envoy config"| XDS
 ```
 
 This happens **before any requests arrive**. The ext_proc filter telling Envoy to send requests to the EPP is part of this translation. At request time, Envoy already has the configuration.
 
 ---
-
-## 3. What Is the Gateway API Inference Extension?
 
 ### The Need for Smarter Routing
 
@@ -212,86 +210,30 @@ Regular load balancers use simple strategies: round-robin, least-connections, ra
 - If you have 5 LLM pods and one of them has your prompt's context cached, routing to that pod is dramatically faster than routing elsewhere.
 - LoRA adapters (fine-tuned model variants) may only be loaded on some pods. Routing to a pod without the adapter means it has to load it first.
 
-The **Gateway API Inference Extension (GIE)** is Kubernetes-native machinery to solve this.
+### Some more info about models and LoRA
 
-### The Key Components
+I just found all this really interesting so documenting that :
 
-```mermaid
-flowchart TB
-    subgraph "GIE Components"
-        IP["InferencePool CRD\nDefines a group of model server pods\nand selects them via labels"]
-        IM["InferenceModel CRD\nMaps client-facing model names\n(e.g. 'gpt-4') to backend model names\n(e.g. 'llama-3-70b-lora-v2')"]
-        EPP["Endpoint Picker (EPP)\nThe 'brain' — an ext_proc server\nthat picks the best pod per request\nbased on live metrics"]
-        BBR["Body Based Router (BBR)\nOptional: parses request body\nto extract model name before routing"]
-    end
+- Base Model: When a company trains an LLM (like LLaMA, Mistral etc.), they train it on massive general internet data. The result is a base model - good at general tasks but not specialized for anything specific
 
-    HTTPRoute -->|"backend ref"| IP
-    IP --> IM
-    IP --> EPP
-    EPP -->|"polls metrics"| ModelPods["Model Server Pods\n(vLLM, llm-d, etc.)"]
+- Fine-tuning: Fine-tuning means taking the base model and training it a little more on your specific domain data.
+
+```
+Base Model
+      +
+Medical documents, clinical notes, drug databases
+      ↓
+Fine-tuned Medical Model
 ```
 
-### What is ext_proc?
+- LoRA (Low-Rank Adaptation): It's a clever technique to fine-tune models very cheaply. The idea is that instead of modifying the billions of original model weights, just train a tiny set of new weights (the adapter) and add them on top of the original model.
 
-`ext_proc` (External Processing) is an Envoy filter that allows an **external gRPC server** to participate in request/response processing. When Envoy receives a request, it can be configured to:
-1. Pause processing
-2. Send the request headers/body to the external server via gRPC
-3. Wait for a response from the external server
-4. Apply the modifications the server requests (e.g., add a header, change destination)
-5. Continue routing with the updated context
-
-The EPP is that external gRPC server. Every inference request must go through this ext_proc round-trip. That is the overhead we are measuring.
-
-### InferencePool vs Regular K8s Service
-
-| Feature | Kubernetes Service | InferencePool |
-|---------|-------------------|---------------|
-| Load balancing | Round-robin / iptables | EPP scheduling (KV-cache aware) |
-| Backend awareness | None | Live metrics from model pods |
-| Model routing | Not possible | Via InferenceModel CRD |
-| LoRA adapter routing | Not possible | EPP knows which pods have which adapters |
-| Cost | Zero (pure Envoy) | ext_proc round-trip per request |
-
----
-
-## 4. How a Request Flows Through the Inference Gateway
-
-Let's walk through step by step what happens when a client sends a request like:
-
-```bash
-curl http://my-gateway.example.com/v1/chat/completions \
-  -d '{"model": "gpt-4", "messages": [{"role": "user", "content": "Hello!"}]}'
 ```
-
-### Step-by-Step Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Client (curl)
-    participant E as Envoy Proxy
-    participant B as BBR (optional)
-    participant P as EPP
-    participant M as Model Server Pod
-
-    C->>E: POST /v1/chat/completions
-
-    Note over E: Route matched: InferencePool backend
-    Note over E: ext_proc filter kicks in
-
-    alt BBR Enabled
-        E->>B: gRPC ProcessingRequest (request headers + body)
-        Note over B: Parses JSON body, extracts model name "gpt-4"<br/>Maps to backend model "llama-3-70b"
-        B->>E: gRPC ProcessingResponse (add header: x-gateway-model:llama-3-70b)
-    end
-
-    E->>P: gRPC ProcessingRequest (request headers)
-    Note over P: Looks at available pods<br/>Checks KV-cache hit probability<br/>Checks which pods have llama-3-70b loaded<br/>Checks queue depths<br/>Selects: Pod-2 (10.0.0.5:8080)
-    P->>E: gRPC ProcessingResponse (add header: x-gateway-destination:10.0.0.5:8080)
-
-    Note over E: Override upstream endpoint to 10.0.0.5:8080
-    E->>M: POST /v1/chat/completions (forwarded)
-    M->>E: 200 OK {"choices": [...]}
-    E->>C: 200 OK (forwarded response)
+Base Model weights (frozen, untouched)
+         +
+LoRA Adapter (tiny, ~10-100MB)
+         =
+Specialized Model behavior
 ```
 
 ### Where Does Time Go?
@@ -307,25 +249,17 @@ By using a **mock model server** with a fixed, configurable latency, we hold mod
 
 ---
 
-## 5. What Is Benchmarking and Why Does It Matter Here?
+### What benchmarks /performance testing we need to do
 
-### What Benchmarking Is
+1. **Added latency**: The EPP round-trip adds N milliseconds to every request. Is N acceptable? How does it grow with load?
 
-Benchmarking is the practice of running a **controlled experiment** to measure how fast a system is under defined conditions. "Controlled" is the key word — if conditions change between runs, results are not comparable.
+2. **Throughput ceiling**: Without inference routing, Envoy may handle 10,000 req/s. With inference routing, does it drop to 7,000 because of the EPP bottleneck?
 
-### Types of Performance Problems We Are Looking For
+3. **Resource overhead**: The EPP pod itself uses CPU and memory. In a cluster with GPUs costing $10/hr, burning extra CPU on routing decisions has real cost.
 
-1. **Added latency** — The EPP round-trip adds N milliseconds to every request. Is N acceptable? How does it grow with load?
+4. find the latency (p90 etc.)
 
-2. **Throughput ceiling** — Without inference routing, Envoy may handle 10,000 req/s. With inference routing, does it drop to 7,000 because of the EPP bottleneck?
-
-3. **Resource overhead** — The EPP pod itself uses CPU and memory. In a cluster with GPUs costing $10/hr, burning extra CPU on routing decisions has real cost.
-
-4. **Tail latency growth** — p99 latency is the 99th percentile: out of every 100 requests, only 1 is slower than p99. For AI workloads, tail latency matters because slow responses feel broken to users.
-
-5. **Load-dependent degradation** — At 10 RPS the EPP is fine; at 500 RPS it becomes the bottleneck and latency explodes. This is called a "hockey stick" curve and we want to find the inflection point.
-
-### Baseline vs Delta Thinking
+5. **Load-dependent degradation** — At 10 RPS the EPP is fine, at 500 RPS it becomes the bottleneck and latency explodes. This is called a "hockey stick" curve and we want to find the inflection point.
 
 The most important thing we measure is not absolute latency but **the delta** between two configurations:
 
@@ -333,53 +267,45 @@ The most important thing we measure is not absolute latency but **the delta** be
 EPP overhead = latency(inference routing) - latency(baseline routing)
 ```
 
-This cancels out any noise from the cluster, the network, or the mock server. The delta is what users care about: *"What am I paying for inference-aware routing?"*
+### We will need a Mock Model Server
 
----
+We cannot run real LLM inference during benchmarks obv. mock server will mimic the API format of a real model server while returning fake responses instantly (or with a configurable delay).
 
-## 6. The Mock Model Server — Why We Need a Fake AI
+Our Options:
 
-### The Core Problem
+#### 1. `llm-d-inference-sim`
+GitHub: llm-d/llm-d-inference-sim
 
-We cannot run real LLM inference during benchmarks because:
-1. Real model inference takes **seconds to minutes** — far too slow to generate meaningful HTTP load numbers
-2. Real models need **GPUs** — not available in CI environments (GitHub Actions runners)
-3. Real models add **enormous variance** — response times vary based on prompt length and content
-4. We would be **benchmarking the LLM**, not kgateway's routing layer
+This was built specifically for this exact problem — testing infrastructure around the GIE without needing GPUs. (Written in Go, which aligns with kgateway's ecosystem) What it does that a naive mock server cannot:
 
-### What the Mock Server Does
+- Real TTFB simulation — simulates the prefill phase latency with configurable jitter (not just a sleep)
+- Inter-token latency — simulates decode phase delays between tokens (realistic SSE streaming)
+- Load-adapting latency — automatically gets slower as concurrent requests increase (just like real vLLM)
+- vLLM Prometheus metrics — exposes /metrics that the EPP actively scrapes for scheduling decisions (KV-cache, queue depth, LoRA adapters — all simulated)
+- LoRA lifecycle simulation — simulates loading/unloading LoRA adapters and reports the right Prometheus metrics
+- KV-cache simulation — the EPP can make real scheduling decisions based on simulated cache state
+- Docker image available — can be loaded directly into Kind
+- OpenAI-compatible API — /v1/chat/completions, streaming SSE, all of it
 
-The mock server mimics the API format of a real model server (OpenAI-compatible) while returning fake responses instantly (or with a configurable delay).
+#### Option 2. GIE's own vLLM simulator
+The GIE project maintains its own simple vLLM simulator for use in their quickstart guide (referenced in their docs at config/manifests/vllm/). It's simpler than llm-d-inference-sim - essentially a lightweight stand-in for their getting-started guide — but would also work if you just need something basic.
 
-```mermaid
-flowchart LR
-    subgraph "Real vLLM Pod"
-        V["Expensive GPU inference\n3-30 second latency\nHigh variance\nOpenAI API"]
-    end
+Instead of building a mock model server, we just:
 
-    subgraph "Mock Model Server (Go)"
-        MS["Instant or fixed-delay response\nOpenAI-compatible API\nConfigurable latency (e.g. 50ms)\nPrometheus /metrics endpoint\n(simulates vLLM metrics for EPP)"]
-    end
+- Pull llm-d-inference-sim as a container image in the benchmark manifests
+- Configure it with the latency, LoRA adapters, and KV-cache parameters we want
+- Point the InferencePool at it
 
-    E["Envoy / EPP"] -->|"in benchmarks"| MS
-```
-
-### Why Go for the Mock Server?
-
-The proposal chooses Go because:
-1. kgateway's entire test infrastructure is in Go
-2. Easy to build into a Docker image and load into Kind (the local K8s setup)
-3. No external dependencies (unlike Python)
-4. The same project can use `go test ./...` to run everything
+(This saves probably 1–1.5 weeks of the estimated timeline since it was the most complex custom component to build. The EPP will also behave more realistically because llm-d-inference-sim simulates real metrics — KV-cache hits, queue depths — that actually influence EPP scheduling decisions.)
 
 ### The vLLM Metrics Endpoint
 
-This is a subtle-but-important detail. The EPP does not just pick endpoints randomly — it **actively polls metrics** from each model server pod to make scheduling decisions. vLLM exposes metrics like:
+This is a subtle but important detail. The EPP does not just pick endpoints randomly - it **actively polls metrics** from each model server pod to make scheduling decisions. vLLM exposes metrics like:
 - `vllm:num_requests_waiting` — how many requests are queued
 - `vllm:gpu_cache_usage_perc` — how full the KV-cache is
 - `vllm:num_requests_running` — current active requests
 
-The EPP reads these to decide where to send the next request. Our mock server must expose these same metrics at `/metrics`, otherwise the EPP cannot function. The mock server will serve plausible-looking values (configurable queue depth, cache usage, etc.).
+The EPP reads these to decide where to send the next request. Our mock server must expose these same metrics at `/metrics`, otherwise the EPP cannot function.
 
 ---
 
