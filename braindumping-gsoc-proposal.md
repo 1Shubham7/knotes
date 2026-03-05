@@ -1,4 +1,146 @@
-# Understanding Inference Routing Benchmarking in kgateway
+# Braindump for Inference Routing Benchmarking in kgateway
+
+## Some key things to know
+
+### First of all, how does model run on k8s?
+
+```
+Kubernetes Cluster
+│
+├── Regular Nodes (CPU only)
+│   ├── kgateway pod
+│   ├── EPP pod
+│   └── other infra pods
+│
+└── GPU Nodes (special machines with GPUs attached)
+    ├── vLLM pod  ← the model runs HERE
+    ├── vLLM pod
+    └── vLLM pod
+```
+
+- The GPU is physically inside the node (the machine). It's not separate.
+
+- Cloud providers (AWS, GCP, Azure) let you rent GPU machines — like an A100 or H100 node.
+
+- Kubernetes schedules the model-serving pod onto that GPU node because the pod requests GPU resources.
+
+```
+Client
+      │
+      │  HTTP POST /v1/chat/completions
+      │  {"model": "llama-3", "messages": [...]}
+      ↓
+┌─────────────────────────────────────────────┐
+│           Kubernetes Cluster                │
+│                                             │
+│  ┌──────────┐                               │
+│  │ kgateway │  ← entry point, like a        │
+│  │ (Envoy)  │    smart reverse proxy        │
+│  └────┬─────┘                               │
+│       │                                     │
+│       │ ext-proc gRPC call                  │
+│       ↓                                     │
+│  ┌─────────┐                                │
+│  │   EPP   │  ← "which pod should I use?"   │
+│  │  (Pod)  │    checks queue depths,        │
+│  └────┬────┘    model availability etc.     │
+│       │                                     │
+│       │ "send to vLLM-pod-2"                │
+│       ↓                                     │
+│  ┌──────────────────────────────────┐       │
+│  │         GPU Node                 │       │
+│  │  ┌────────────┐                  │       │
+│  │  │ vLLM Pod   │                  │       │
+│  │  │            │                  │       │
+│  │  │ [GPU]──────│── model weights  │       │
+│  │  │            │   in VRAM        │       │
+│  │  └─────┬──────┘                  │       │
+│  └────────┼─────────────────────────┘       │
+└───────────┼─────────────────────────────────┘
+            │
+            │  HTTP response (generated tokens)
+            ↓
+          Client
+```
+
+### What is an InferencePool?
+An InferencePool is a Kubernetes custom resource (CRD) that represents a group of AI model-serving backends — think of it like a smart load-balancer pool, but specifically designed for AI inference workloads.
+
+A regular Kubernetes Service just groups pods by label. An InferencePool goes further — it knows things like:
+
+Which pods are serving which models
+What the queue depth / load is on each pod
+Which pods support specific LoRA adapters
+
+```yaml
+# Rough idea of what it looks like
+apiVersion: inference.networking.x-k8s.io/v1alpha2
+kind: InferencePool
+metadata:
+  name: my-llm-pool
+spec:
+  selector:
+    app: vllm-server    # which pods belong to this pool
+  extensionRef:
+    name: epp-service   # the EPP that makes routing decisions
+```
+
+### What is the Translation Pipeline?
+
+The translation pipeline is the **process kgateway runs at configuration time** (before any traffic flows) to convert your Kubernetes resources into actual Envoy configuration.
+
+### What is EPP?
+
+EPP stands for Endpoint Picker Pod. It's the "brain" of the inference routing system — the external gRPC server that makes the actual smart routing decisions at request time.
+
+```
+Client Request
+      ↓
+   Envoy (kgateway)
+      ↓
+   [ext-proc call] ──→  EPP (Endpoint Picker Pod)
+                              ↓
+                        Looks at all pods in
+                        the InferencePool and
+                        picks the BEST one
+                              ↓
+                        Returns: "send this to pod-X"
+      ↓
+   Envoy forwards to pod-X
+      ↓
+   LLM Backend (e.g. vLLM)
+```
+
+### What is ext-proc?
+
+ext-proc stands for External Processing. It's an Envoy proxy feature that allows an external gRPC server to inspect and modify HTTP requests/responses in-flight, mid-proxy.
+
+Normally, when a request hits Envoy, Envoy routes it and that's it. With ext-proc, Envoy can pause the request and ask an external service: "Hey, what should I do with this?" — then act on that service's instructions before forwarding the request.
+
+### What is GIE (Gateway Inference Extension)?
+
+The Gateway Inference Extension (GIE) is the entire system that adds AI-awareness to a standard Kubernetes gateway.
+
+```
+┌─────────────────────────────────────────────┐
+│         Gateway Inference Extension         │
+│                                             │
+│  ┌─────────────┐     ┌─────────────────┐   │
+│  │ InferencePool│     │ InferenceModel  │   │
+│  │    (CRD)    │     │     (CRD)       │   │
+│  └─────────────┘     └─────────────────┘   │
+│                                             │
+│  ┌─────────────────────────────────────┐   │
+│  │              EPP                    │   │
+│  │  (the actual routing brain)         │   │
+│  └─────────────────────────────────────┘   │
+│                                             │
+│  ┌─────────────────────────────────────┐   │
+│  │         ext-proc interface          │   │
+│  │  (how gateway talks to EPP)         │   │
+│  └─────────────────────────────────────┘   │
+└─────────────────────────────────────────────┘
+```
 
 ## 1. The Big Picture
 
