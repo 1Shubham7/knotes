@@ -8,27 +8,9 @@
 4. Provide **automated execution** via CI and documented scripts
 5. Produce **clear documentation** for methodology, results interpretation, and best practices
 
-### Relationship to Existing Work
+### Existing Work
 
-> [!IMPORTANT]
 > kgateway already has a load testing framework design at [design/11210](file:///home/shubham/Code/Personal/kgateway/design/11210-kgateway-load-testing-framework.md) focused on **control-plane scalability** (route attachment time, route propagation, configuration changes). This proposal is **complementary** -- it focuses on **data-plane performance** of the inference routing extensions specifically, measuring latency, throughput, and resource overhead when inference requests flow through the gateway.
-
----
-
-## 2. Background and Context
-
-### What is the Gateway API Inference Extension (GIE)?
-
-The GIE is a Kubernetes-native system that transforms any ext-proc-capable gateway (like kgateway/Envoy) into an **Inference Gateway** optimized for serving Generative AI workloads.
-
-**Key Components:**
-
-| Component | Description |
-|-----------|-------------|
-| **InferencePool** | K8s CRD defining a pool of model-serving backends (e.g., vLLM pods) |
-| **Endpoint Picker (EPP)** | ext_proc server that selects the optimal backend based on KV-cache state, LoRA adapter availability, request cost, etc. |
-| **Body Based Router (BBR)** | Optional ext_proc server that parses request bodies to extract model names for routing |
-| **InferenceModel** | CRD mapping client-facing model names to backend-specific models/adapters |
 
 ### How kgateway Integrates GIE
 
@@ -159,14 +141,7 @@ We define **four scenario categories** to comprehensively evaluate inference rou
 
 #### Scenario 1: Baseline vs Inference-Enabled Routing
 
-> Compare standard kgateway routing (HTTPRoute -> Service) against inference-enabled routing (HTTPRoute -> InferencePool -> EPP -> Model Server).
-
-| Aspect | Baseline | Inference-Enabled |
-|--------|----------|-------------------|
-| Backend ref | Kubernetes Service | InferencePool |
-| ext_proc | None | EPP |
-| Routing decision | Envoy round-robin | EPP scheduling algorithm |
-| Purpose | Establish performance floor | Measure inference overhead |
+- Compare the standard kgateway routing (HTTPRoute -> Service) against inference-enabled routing (HTTPRoute -> InferencePool -> EPP -> Model Server).
 
 **What we measure:** The raw overhead introduced by the inference routing path (EPP ext_proc call latency, additional network hops).
 
