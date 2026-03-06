@@ -365,34 +365,18 @@ In streaming requests: latency has two parts:
 1. **TTFB** — time until the first SSE chunk arrives (includes EPP routing overhead)
 2. **Streaming duration** — time to receive all subsequent chunks (model's generation speed)
 
-The routing overhead only affects TTFB, not streaming duration. Our benchmarks will measure both separately.
+The routing overhead only affects TTFB, not streaming duration. This maybe something we should also benchmark.
 
 ---
 
-## 9. Understanding Resource Overhead
-
-### Why Resource Metrics Matter
+### Understanding Resource Overhead
 
 If the EPP uses 500 millicores of CPU to serve 1000 req/s, that is a real cost. In production, that CPU comes at the expense of:
 - Running more model server pods
 - Running other services
 - Your cloud bill
 
-### The Components That Use Resources
-
-```mermaid
-flowchart TB
-    subgraph "Pods we will measure"
-        E["Envoy Pod\nCPU: routing + ext_proc filter\nMemory: connection state + buffers"]
-        EPP["EPP Pod\nCPU: request scheduling algorithm\nMemory: cache of pod metrics"]
-        BBR["BBR Pod (optional)\nCPU: JSON body parsing\nMemory: minimal"]
-        KGW["kgateway controller Pod\nCPU: config translation (done ahead of time)\nMemory: KRT collections"]
-    end
-```
-
-### How We Measure It
-
-We use **Prometheus** + **cAdvisor** (which runs on every Kubernetes node and reports container-level resource usage). We query:
+We will use **Prometheus** + **cAdvisor** (which runs on every Kubernetes node and reports container-level resource usage). We query:
 
 ```promql
 # CPU usage of the EPP pod (in millicores)
@@ -405,9 +389,7 @@ container_memory_working_set_bytes{pod=~"epp-.*"}
 We collect these metrics **during the load test** and report:
 1. Baseline resource usage (no inference extensions)
 2. Inference-enabled resource usage
-3. Delta (the cost of inference routing)
-
----
+3. and the delta (the cost of inference routing)
 
 ## 10. Streaming vs Non-Streaming Inference
 
@@ -415,22 +397,18 @@ We collect these metrics **during the load test** and report:
 
 Most LLM APIs support two modes:
 
-**Non-streaming** (default):
-```
-Client:  POST /v1/chat/completions (request)
-                        [waits 3 seconds]
-Server:  200 OK {"choices": [{"message": {"content": "Hello! I am Claude..."}}]}
-```
+- **Non-streaming** (default): client sends complete resp at once.
 
-**Streaming** (SSE — Server-Sent Events):
+- **Streaming** (SSE — Server-Sent Events):
+
 ```
-Client:  POST /v1/chat/completions (request, stream=true)
-Server:  data: {"choices": [{"delta": {"content": "Hello"}}]}
-         data: {"choices": [{"delta": {"content": "!"}}]}
-         data: {"choices": [{"delta": {"content": " I"}}]}
-         data: {"choices": [{"delta": {"content": " am"}}]}
-         ... (one chunk per generated token)
-         data: [DONE]
+Client sends request
+        ↓
+Server generates token 1 → sends it immediately
+Server generates token 2 → sends it immediately
+Server generates token 3 → sends it immediately
+     ↓
+Client displays tokens as they arrive (like typing effect)
 ```
 
 Streaming is preferred for interactive use because users start seeing output immediately instead of waiting for the full response.
@@ -443,7 +421,7 @@ Streaming is preferred for interactive use because users start seeing output imm
 
 3. **Back-pressure** — if the model server is slow, chunks arrive slowly, and the connection lingers. This can starve resources if too many slow streaming connections pile up.
 
-4. **k6 SSE parsing** — our k6 scripts must read the SSE stream and measure TTFB (time until the first data: frame) and total stream duration separately.
+Streaming introduces metrics that don't even exist in non-streaming: like Time to First Token (TTFT), Time Between Tokens (TBT), etc.
 
 ### What We Benchmark for Streaming
 
@@ -454,96 +432,35 @@ Streaming is preferred for interactive use because users start seeing output imm
 | **Concurrent streams** | How many simultaneous streaming connections before Envoy degrades |
 | **Error rate** | Disconnected streams, timeout rates |
 
----
+So we will write tests for non streaming model, but ask maintainers about these as well (as streaming is a more application than non streaming in llms)  
 
-## 11. Prometheus
+## Benchmark Scenarios
 
-### What Prometheus Is
+### 1. Baseline vs Inference-Enabled
 
-Prometheus is an open-source metrics system widely used in the Kubernetes ecosystem. It works by **scraping** (polling) HTTP `/metrics` endpoints on your services at a regular interval (usually every 15 seconds) and storing the results as time-series data.
+This is the most important scenario. We run identical load against two configurations:
 
-### How It Works in Our Setup
-
-```mermaid
-flowchart LR
-    subgraph "Cluster"
-        E["Envoy /admin/metrics\n(Envoy stats)"]
-        EPP["/metrics\n(EPP Prometheus metrics)"]
-        MS["/metrics\n(Mock server fake vLLM metrics)"]
-        CA["/metrics\n(cAdvisor — container resources)"]
-        PROM["Prometheus\n(scrapes all /metrics endpoints\never 15s, stores time-series)"]
-    end
-
-    PROM -->|"scrape every 15s"| E
-    PROM -->|"scrape every 15s"| EPP
-    PROM -->|"scrape every 15s"| MS
-    PROM -->|"scrape every 15s"| CA
-
-    GO["Go results processor"]
-    PROM -->|"PromQL API query\nafter benchmark"| GO
-    GO --> RPT["Benchmark Report"]
-```
-
-### Why Prometheus and Not Just Logging?
-
-Logging raw numbers works for small experiments but becomes unmanageable when you have hundreds of metrics across dozens of pods over 30 minutes of test. Prometheus:
-- **Stores data efficiently** — compressed time-series database
-- **Makes querying easy** — PromQL is a powerful query language
-- **Is already deployed** — the kgateway project uses Prometheus for its own metrics (`kgateway_collection_transforms_total`, etc.)
-- **Integrates with Grafana** — for visual dashboards during manual benchmark runs
-
-### Key PromQL Queries Used in the Report
-
-```promql
-# EPP average CPU over the benchmark window
-avg_over_time(rate(container_cpu_usage_seconds_total{pod=~"epp-.*"}[1m])[30m:])
-
-# Envoy's ext_proc stream count
-envoy_ext_proc_streams_started{cluster="epp-cluster"}
-
-# Envoy's p99 request latency (from Envoy's own histogram)
-histogram_quantile(0.99, rate(envoy_http_downstream_rq_time_bucket[5m]))
-```
-
----
-
-## 12. The Benchmark Scenarios in Detail
-
-### Scenario 1: Baseline vs Inference-Enabled
-
-This is the most important scenario. We run **identical load** against two configurations:
-
-```mermaid
-flowchart LR
-    subgraph "Baseline Configuration"
-        C1["Client"] --> EP1["Envoy"] --> SVC["K8s Service"] --> MS1["Mock Server pods"]
-    end
-
-    subgraph "Inference Configuration"
-        C2["Client"] --> EP2["Envoy"] -->|"ext_proc call"| EPP["EPP"] --> EP2
-        EP2 --> MS2["Mock Server pods\n(selected by EPP)"]
-    end
-```
+Client --> Envoy --> K8s Service --> Mock Server pods
+and 
+Client --> Envoy --> ext_proc call EPP --> Mock Server pods (selected by EPP)
 
 **What changes between the two:**
 - Baseline: `HTTPRoute` points to a regular `Service`
 - Inference: `HTTPRoute` points to an `InferencePool`; Envoy's ext_proc filter routes through EPP
 
-**What we measure:** The **absolute latency and throughput difference**. This is the "cost" of inference-aware routing.
+we measure the absolute latency and throughput difference. This is the "cost" of inference-aware routing.
 
 ### Scenario 2: EPP Configuration Variations
 
 The EPP supports different modes. Each adds more complexity to the scheduling decision (and thus potentially more latency):
 
-| Config | Complexity | Description |
+| configuration | complexity | description |
 |--------|-----------|-------------|
 | **Default EPP** | Low | Basic load-balancing with queue-depth awareness |
 | **EPP + BBR** | Medium | Adds body parsing for model name extraction |
 | **Prefix-cache-aware** | High | EPP considers KV-cache hit probability |
 | **LoRA-aware** | High | EPP routes based on which LoRA adapters are loaded |
 | **Multiple InferenceModels** | Medium | Multiple model -> adapter mappings in one pool |
-
-**Why this matters:** Different users deploy EPP differently. We want to show which configurations are "free" and which are "expensive" in terms of added latency.
 
 ### Scenario 3: Payload Size Impact
 
@@ -557,7 +474,7 @@ We test three payload sizes:
 - **Medium** (~2 KB): Typical chat history with 200-token context
 - **Large** (~8 KB): Long document summarization with 2000-token context
 
-### Scenario 4: Streaming Workloads
+### Scenario 4: Streaming Workloads (ask maintainers)
 
 Run the same load profiles but with `"stream": true` in the request body. The mock server will respond with SSE chunks at a configurable rate (e.g., 1 chunk every 50ms for 20 chunks = 1 second of streaming).
 
@@ -566,172 +483,26 @@ Run the same load profiles but with `"stream": true` in the request body. The mo
 - Concurrent connections at sustained streaming load
 - Connection pool exhaustion behavior
 
----
-
-## 13. The Go Test Harness
-
-### What the Harness Does
-
-The Go test harness is the "orchestrator" of the entire benchmark. It:
-
-1. **Sets up the environment** — creates the Kind cluster, installs kgateway via Helm, applies GIE CRDs, deploys mock model servers, deploys Prometheus
-2. **Runs k6** — invokes k6 as a subprocess, passing environment variables like `GATEWAY_URL` and `SCENARIO`
-3. **Collects results** — reads k6's JSON output and queries Prometheus for resource metrics
-4. **Generates reports** — produces Markdown and JSON reports
-5. **Tears down** — cleans up the cluster
-
-### Why Go Instead of a Shell Script?
-
-You could do all of this in a shell script (`bash`). However:
-- The kgateway project uses Go for its entire test infrastructure (`test/e2e/`)
-- Go gives us proper error handling, types, and testing patterns
-- The Go harness can integrate with `make benchmark` and even with `go test` directly
-- Complex Kubernetes interactions (applying manifests, waiting for pods, port-forwarding) are much easier in Go with the `client-go` library
-
 ### Integration with kgateway's Existing Test Infrastructure
 
-kgateway uses a testify-based e2e framework in `test/e2e/`. The benchmark harness will follow the same patterns:
+we will
 - Use `testify` for test assertions and setup/teardown
 - Use the same Kind cluster setup scripts
-- Register as a suite that can be run with `make benchmark` (or `go test`)
+- Register as a suite that can be run with `make benchmark` or something.
 
-This means benchmark runs use **identical cluster infrastructure** to e2e tests, minimizing "it works in benchmark but not in e2e" surprises.
+### CI/CD Integration
 
----
-
-## 14. CI/CD Integration
-
-### Why Automate Benchmarks?
-
-Without automation, benchmarks get run once (when setting up the framework) and then forgotten. Performance regressions creep in silently. With automation:
-- Every release is benchmarked
-- Regressions are caught before they ship
-- Historical data shows trends
-
-### When Do Benchmarks Run?
+When Do Benchmarks Run?
 
 | Trigger | Why |
 |---------|-----|
-| **Nightly** | Regular check; catches regressions within 24 hours |
+| **Nightly** | Regular check; catches regressions within 24 hours (ask maintainers) |
 | **Release tags** | Official baseline data for each version |
 | **Manual dispatch** | For on-demand investigation |
 | **PRs (label-gated)** | `benchmark` label triggers it; not on every PR — too slow/expensive |
 
-**Why not on every PR?** Benchmark runs take 20-40 minutes and require a full Kind cluster setup. Running this on every PR would make CI very slow and expensive. We gate it behind a label that maintainers can apply when a PR might affect performance.
-
-### What the CI Workflow Looks Like
-
-```yaml
-# .github/workflows/benchmark.yaml (simplified)
-name: Inference Routing Benchmarks
-
-on:
-  schedule:
-    - cron: '0 2 * * *'  # Run at 2 AM UTC every night
-  release:
-    types: [published]
-  workflow_dispatch:     # Manual trigger
-
-jobs:
-  benchmark:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: Create Kind cluster
-        run: make kind-create
-      - name: Install kgateway with inference extension
-        run: make deploy-kgateway HELM_VALUES=inference-enabled
-      - name: Install k6
-        run: go install go.k6.io/k6@latest
-      - name: Run benchmarks
-        run: make benchmark
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results-${{ github.sha }}
-          path: test/benchmark/results/
-      - name: Comment on PR (if applicable)
-        if: github.event_name == 'pull_request'
-        uses: ...
-```
+Benchmark runs take 20-40 minutes and require a full Kind cluster setup. Running this on every PR would make CI very slow and expensive. We gate it behind a label that maintainers can apply when a PR might affect performance.
 
 ### Regression Detection
 
 The Go results processor will compare current results against a **stored baseline** (a JSON file committed to the repository with known-good numbers). If a metric regresses by more than a threshold (e.g., p99 latency increases by >20%), the CI job fails with a clear error message.
-
----
-
-## 15. Key Design Decisions and Trade-offs
-
-### Decision 1: k6 vs Custom Go Load Generator
-
-**k6:**
-- Pro: Rich scripting, built-in metrics, active community, extensions
-- Pro: Handles SSE streaming natively via JS scripting
-- Con: Another binary/dependency to install in CI
-- Con: JavaScript, not Go (foreign language in a Go project)
-
-**Custom Go:**
-- Pro: Consistent with project language; no extra dependencies
-- Pro: Can use existing e2e test helpers
-- Con: Reinventing the wheel — metrics collection, reporting, all custom
-- Con: SSE streaming support requires custom implementation
-
-**Decision: k6 as primary, Go harness as orchestrator.** The harness calls k6 as a subprocess. This keeps the load generation logic clean in JavaScript while keeping the infrastructure in Go.
-
-### Decision 2: Mock Server vs Real vLLM
-
-**Mock server:**
-- Pro: Works everywhere (CI, laptop, no GPU needed)
-- Pro: Controllable, reproducible latency
-- Con: Does not accurately represent real vLLM behavior
-- Con: EPP scheduling decisions may be unrealistic
-
-**Real vLLM:**
-- Pro: Realistic workload
-- Con: Requires GPU hardware (expensive in CI)
-- Con: Response times vary by model and prompt (hard to isolate routing overhead)
-
-**Decision: Mock server as default, real vLLM as an optional bonus.** The framework is designed so that you can replace the mock server URL with a real vLLM endpoint. This lets the framework be used both for isolated routing benchmarks (in CI) and realistic end-to-end performance testing (manually, with real hardware).
-
-### Decision 3: Prometheus vs Simpler Metrics Collection
-
-**Prometheus:**
-- Pro: Already used by kgateway project
-- Pro: Rich query language, time-series data
-- Pro: Works with existing Grafana dashboards
-- Con: Another component to deploy in the benchmark cluster
-
-**CSV/Log-based collection:**
-- Pro: Simple, no extra dependencies
-- Con: Manual analysis, no time-series, hard to correlate across components
-
-**Decision: Prometheus.** The complexity is justified because we need time-series data (how did CPU change as load increased?) and because kgateway already has Prometheus infrastructure.
-
----
-
-## 16. Glossary
-
-| Term | Definition |
-|------|-----------|
-| **ext_proc** | Envoy's External Processing filter — allows an external gRPC server to participate in request/response processing |
-| **EPP** | Endpoint Picker — the ext_proc server in GIE that selects the optimal model server pod for each request |
-| **BBR** | Body Based Router — optional ext_proc server that parses request bodies to extract model names |
-| **GIE** | Gateway API Inference Extension — the upstream project that defines InferencePool, InferenceModel, EPP |
-| **InferencePool** | Kubernetes CRD that defines a pool of model-serving backends |
-| **InferenceModel** | Kubernetes CRD that maps client-facing model names to backend models/LoRA adapters |
-| **SSE** | Server-Sent Events — HTTP streaming protocol where the server pushes data chunks to the client over one long-lived connection |
-| **TTFB** | Time to First Byte — time from when a request is sent until the first byte of the response is received |
-| **p50 / p95 / p99** | Latency percentiles: 50th, 95th, and 99th values in a sorted distribution of response times |
-| **KV-cache** | Key-Value cache in LLM inference — stores previously computed attention weights to avoid recomputation for seen prompts |
-| **LoRA** | Low-Rank Adaptation — a technique for fine-tuning LLMs efficiently; fine-tuned variants are called LoRA adapters |
-| **xDS** | Envoy's control plane protocol — kgateway uses this to push config to Envoy |
-| **Kind** | Kubernetes IN Docker — runs a full Kubernetes cluster inside Docker containers on your laptop; used for local development and CI |
-| **Helm** | Kubernetes package manager — kgateway is installed via Helm charts |
-| **Prometheus** | Open-source metrics scraping and storage system widely used in Kubernetes |
-| **cAdvisor** | Container Advisor — Kubernetes-native daemon that reports container-level CPU and memory metrics |
-| **PromQL** | Prometheus Query Language — used to query and compute metrics from the Prometheus database |
-| **Control plane** | kgateway itself — the component that reads Kubernetes resources and translates them to Envoy config |
-| **Data plane** | Envoy — the component that actually handles network traffic |
-| **QPS / RPS** | Queries/Requests Per Second — throughput measure |
-| **Hockey stick curve** | A latency-vs-throughput curve that is flat (healthy) up to a point and then shoots upward as the system is overloaded |
