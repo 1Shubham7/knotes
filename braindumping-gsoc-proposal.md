@@ -309,24 +309,7 @@ The EPP reads these to decide where to send the next request. Our mock server mu
 
 ---
 
-## 7. Load Generation
-
-### What a Load Generator Does
-
-A load generator sends many HTTP requests to your system and measures what comes back. Good load generators give you:
-- **Controlled arrival rate** — send exactly N requests per second, not "as fast as possible"
-- **Percentile metrics** — not just average latency (which lies) but p50, p95, p99
-- **Configurable scenarios** — ramp up slowly, sustain, then spike
-
-### Why Not Just Use `curl` or `wrk`?
-
-`curl` is sequential (one request at a time). `wrk` is concurrent but limited scripting. For our use case we need:
-- **SSE streaming support** — inference responses are streamed; not all tools handle this
-- **Custom JSON bodies** — each request is a specific OpenAI chat completion payload
-- **Multiple scenarios** — ramp-up profiles, different payload sizes
-- **Prometheus-compatible output** — to store and compare results across runs
-
-### Why k6?
+### Load Generation (k6) (yet to decide which one to use
 
 k6 is a load testing tool built by Grafana Labs. It is:
 - **Scripted in JavaScript** — easy to write complex request logic (build JSON body, parse SSE responses)
@@ -334,58 +317,7 @@ k6 is a load testing tool built by Grafana Labs. It is:
 - **Built for HTTP benchmarking** — first-class support for all the metrics we need
 - **Extensible** — can push results to Prometheus via an official extension (xk6-output-prometheus-remote-write)
 
-Here is a simplified k6 script to give you intuition:
-
-```javascript
-import http from 'k6/http';
-import { check } from 'k6';
-
-export const options = {
-  // "ramping-arrival-rate" sends a FIXED number of requests per second
-  // regardless of how long each one takes. This is more realistic than
-  // "ramping-vus" which just has N concurrent users.
-  scenarios: {
-    ramp: {
-      executor: 'ramping-arrival-rate',
-      startRate: 10,
-      timeUnit: '1s',
-      preAllocatedVUs: 100,
-      stages: [
-        { target: 50, duration: '60s' },   // ramp up to 50 req/s over 60s
-        { target: 200, duration: '60s' },  // ramp up to 200 req/s over 60s
-        { target: 10, duration: '30s' },   // cool down
-      ],
-    },
-  },
-  // "thresholds" are pass/fail criteria — k6 exits with error if violated
-  thresholds: {
-    http_req_duration: ['p(99)<500'],   // fail if 99th percentile > 500ms
-    http_req_failed: ['rate<0.01'],     // fail if error rate > 1%
-  },
-};
-
-export default function () {
-  const body = JSON.stringify({
-    model: 'test-model',
-    messages: [{ role: 'user', content: 'Hello world' }],
-  });
-
-  const res = http.post(`${__ENV.GATEWAY_URL}/v1/chat/completions`, body, {
-    headers: { 'Content-Type': 'application/json' },
-  });
-
-  check(res, {
-    'is 200': (r) => r.status === 200,
-  });
-}
-```
-
-The `__ENV.GATEWAY_URL` is injected from the Go harness, making every part of the system configurable without hardcoding URLs.
-
-### The Load Profiles We Run
-
 We run a **ramp-up profile** (not constant load) because:
-- Constant load tells you how the system performs at one specific rate
 - Ramp-up reveals the **hockey stick** — at what RPS does latency start exploding?
 
 ```
@@ -402,19 +334,11 @@ Latency
 
 We want to find the inflection point for both baseline routing and inference routing.
 
----
-
-## 8. Understanding Latency Metrics (p50, p95, p99)
+### Understanding Latency Metrics (p50, p95, p99)
 
 ### Why Not Average Latency?
 
-Average latency hides the tail. Imagine 100 requests: 99 take 10ms, and 1 takes 10,000ms (10 seconds). The average is:
-
-```
-(99 × 10 + 1 × 10000) / 100 = 109.9ms
-```
-
-The average says "110ms" but a user got a 10-second response. **Percentiles are far more useful.**
+Average latency hides the tail. Imagine 100 requests: 99 take 10ms, and 1 takes 10,000ms (10 seconds). The average is 109.9ms. The average says "110ms" but a user got a 10-second response. **Percentiles are far more useful.**
 
 ### What Percentiles Mean
 
@@ -422,7 +346,7 @@ Running 1000 requests and sorting by latency:
 
 | Percentile | Meaning |
 |-----------|---------|
-| **p50** | 50% of requests took this long or less. (The "median" — most typical experience) |
+| **p50** | 50% of requests took this long or less. (The "median") |
 | **p95** | 95% of requests took this long or less. (Only 1 in 20 is slower) |
 | **p99** | 99% of requests took this long or less. (Only 1 in 100 is slower) |
 
@@ -430,18 +354,6 @@ For AI inference routing, we care about:
 - **p50** — what does a typical request feel like?
 - **p95** — what does a power user who sends lots of requests experience?
 - **p99** — what is the worst-case "tail" for your SLA? Most production SLAs are written at p99.
-
-### What We Expect to See
-
-With no inference extensions:
-- p50: ~2-5ms (pure Envoy routing)
-- p99: ~10-20ms
-
-With inference extensions (EPP ext_proc):
-- p50: ~5-15ms (adds EPP gRPC round-trip per request)
-- p99: ~20-100ms (EPP becomes bottleneck under load)
-
-The exact numbers are what we will discover. The point is the **delta** tells us the EPP's cost.
 
 ### Time to First Byte (TTFB) for Streaming
 
