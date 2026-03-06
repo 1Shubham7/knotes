@@ -1,33 +1,5 @@
 # Benchmarking and Performance Evaluation of Inference Routing Extensions in kgateway
 
-## Table of Contents
-
-- [1. Project Overview](#1-project-overview)
-- [2. Background and Context](#2-background-and-context)
-- [3. Architecture Deep-Dive](#3-architecture-deep-dive)
-- [4. Benchmark Design](#4-benchmark-design)
-- [5. Tools Selection and Analysis](#5-tools-selection-and-analysis)
-- [6. Implementation Plan](#6-implementation-plan)
-- [7. Metrics and Data Collection](#7-metrics-and-data-collection)
-- [8. CI/CD Automation](#8-cicd-automation)
-- [9. Documentation Plan](#9-documentation-plan)
-- [10. Timeline and Milestones](#10-timeline-and-milestones)
-- [11. TODO Checklist](#11-todo-checklist)
-
----
-
-## 1. Project Overview
-
-### Problem Statement
-
-kgateway provides inference routing capabilities via the [Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension) (GIE). This integration enables model-aware routing, serving priority, and customizable load-balancing of self-hosted Generative AI models through Envoy's External Processing (ext_proc) filter.
-
-However, there is **no standardized or reproducible way** to evaluate the performance impact of these inference routing extensions. Users and maintainers cannot quantify:
-- How much latency does the inference routing layer add?
-- What is the throughput ceiling with inference extensions enabled?
-- What is the CPU/memory overhead of running the Endpoint Picker (EPP) and Body Based Router (BBR)?
-- How do different EPP configurations and scheduling algorithms affect performance?
-
 ### Goals
 
 1. Design and implement a **reproducible benchmarking framework** for inference routing extensions
