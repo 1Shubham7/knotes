@@ -117,10 +117,10 @@ flowchart TB
         end
     end
 
-    subgraph "Result Storage"
-        LOCAL["Local (pod filesystem)"]
-        GCS["Google Cloud Storage"]
-        S3["AWS S3"]
+    subgraph "Result Extraction"
+        HOST["Host Filesystem<br/>test/benchmark/results/<br/>(kubectl cp before teardown)"]
+        GCS["Google Cloud Storage<br/>(nightly / release)"] 
+        S3["AWS S3<br/>(alternative)"]
     end
 
     IP -->|"POST /v1/chat/completions<br/>(Scenario A)"| IGW_RT
@@ -137,12 +137,43 @@ flowchart TB
     EPP -.->|"metrics scrape"| MS1 & MS2 & MSN
     PROM -.->|"scrape"| ENV & EPP & CA
 
-    IP -->|"results JSON"| LOCAL
-    LOCAL -.->|"optional upload"| GCS & S3
+    IP -->|"writes results JSON<br/>inside pod"| IP
+    IP -.->|"kubectl cp (before teardown)<br/>→ host filesystem"| HOST
+    HOST -.->|"upload (CI only)"| GCS & S3
 ```
 
 > [!NOTE]
 > **What we are NOT including:** Jupyter notebook analysis, HuggingFace dataset downloads, or Looker Studio dashboards. These are part of the upstream GIE project's internal tooling. Our reporting will use Go-generated Markdown + JSON summaries, consistent with kgateway's existing test infrastructure.
+
+### Test Setup Flow
+
+Sequential steps for a complete benchmark run:
+
+```mermaid
+flowchart TD
+    A(["Start"])
+    A --> B["1. Create Kind cluster<br/>(cluster-kind.sh)"]
+    B --> C["2. Install kgateway<br/>with inference extension enabled<br/>(install-kgateway.sh)"]
+    C --> D["3. Deploy llm-d-inference-sim<br/>×3 replicas + Service"]
+    D --> E["4. Deploy EPP<br/>pointed at llm-d-sim pods"]
+    E --> F["5. Apply InferencePool + InferenceModel CRDs<br/>+ Gateway + HTTPRoutes<br/>(Scenario A: IGW, Scenario B: k8s svc)"]
+    F --> G["6. Deploy Prometheus + cAdvisor<br/>(resource metrics collection)"]
+    G --> H["7. Wait for all pods Ready<br/>(health checks)"]
+    H --> I["8. Run inference-perf jobs<br/>Scenario A and B in parallel"]
+    I --> J["9. Run LPG regression test<br/>(against committed baseline profile)"]
+    J --> K["10. kubectl cp results from pod<br/>→ test/benchmark/results/<br/>(before cluster teardown!)"]
+    K --> L["11. Query Prometheus<br/>for CPU / memory snapshots"]
+    L --> M["12. Generate Markdown + JSON report<br/>(Go harness: report.go)"]
+    M --> N{"CI run?"}
+    N -->|"Yes"| O["13a. Upload results to GCS / S3<br/>Upload artifact to GitHub Actions"]
+    N -->|"No (local)"| P["13b. Print report to stdout<br/>Results saved locally"]
+    O --> Q["14. Tear down Kind cluster"]
+    P --> Q
+    Q --> R(["Done"])
+```
+
+> [!IMPORTANT]
+> **Step 10 (kubectl cp) must happen before cluster teardown.** `inference-perf` writes its JSON output inside the pod's filesystem. Since Kind runs locally and the cluster is deleted at the end, the Go harness extracts results to `test/benchmark/results/` on the host before calling teardown. In CI, this host path is then uploaded as a GitHub Actions artifact.
 
 ---
 
@@ -154,7 +185,7 @@ flowchart TB
 | 2 | `inference-perf` integration | Configure and wire up for kgateway-specific scenarios |
 | 3 | IGW vs k8s service comparison | Side-by-side benchmark with TPOT/ITL/TTFT metrics |
 | 4 | LPG regression testing | Latency Profile Generator for CI regression detection |
-| 5 | 4 upstream test configs | Prefix Cache Aware, Decode Heavy, Prefill Heavy, Multi-LoRA |
+| 5 | **6** upstream test configs | Standard, Prefix-Cache High, Prefix-Cache Low, Decode Heavy, Prefill Heavy, Multi-LoRA |
 | 6 | Result storage (local + GCS/S3) | Store JSON results; upload to cloud on release runs |
 | 7 | Periodic CI job (nightly) | GitHub Actions workflow against `main` branch |
 | 8 | Markdown + JSON reporting | Go-generated report; no Jupyter or external dashboards |
@@ -172,63 +203,89 @@ flowchart TB
 
 ## 5. Benchmark Configurations
 
-We adopt the same four configurations as the upstream GIE benchmark, tailored for kgateway.
+We adopt the **6 workload profiles** from the upstream GIE benchmark, tailored for kgateway. All run against both targets (IGW vs k8s service) simultaneously.
 
-### 5.1. Standard Comparison (IGW vs k8s Service)
+### 5.0. Workload Summary Table
 
-The foundational benchmark — identical to what the upstream GIE project publishes:
+| Profile | Token Characteristics | QPS Stages | Primary Metric | Upstream Dataset |
+|---------|----------------------|------------|----------------|-----------------|
+| **Standard** | General purpose, mixed lengths | 10 → 20 → 30 | E2E latency, throughput | shareGPT |
+| **Prefill-Heavy** | Long input (~2000 tokens), short output | 300 → 310 → 320 → 330 | TTFT p95/p99 | billsum_conversations |
+| **Decode-Heavy** | Short input (~50 tokens), long output (~500+ tokens) | 200 → 210 → 220 | TPOT, ITL | infinity_instruct |
+| **Prefix-Cache High** | Long system prompt (2048 tokens) + short question (256 tokens) | 100 → 300 → 500 | TTFT (cache hit delta) | shared_prefix |
+| **Prefix-Cache Low** | Short system prompt (256 tokens) + long question (2048 tokens) | 100 → 300 → 500 | TTFT (cache miss cost) | shared_prefix |
+| **Multi-LoRA** | Decode-heavy, mixed across 15 LoRA adapters | 20 → 200 | Per-adapter TPOT, error rate | infinity_instruct |
+
+### 5.1. Why We Don't Use the Upstream Real Datasets
+
+> [!NOTE]
+> The upstream GIE benchmarks use real NLP datasets (shareGPT, billsum, infinity_instruct) because they benchmark **actual vLLM inference** — the model needs realistic prompts to produce meaningful token timing data.
+>
+> **kgateway's benchmark tests the gateway routing layer, not model inference.** We use `llm-d-inference-sim` which simulates responses without processing prompt content. It uses configurable token distributions to replicate the *shape* of each workload (input length, output length, arrival rate) without requiring:
+> - HuggingFace tokens or API access
+> - Large dataset downloads (shareGPT is ~700 MB)
+> - GPU to actually run inference
+>
+> We configure `llm-d-inference-sim` with the same token length ranges as each upstream dataset to get equivalent load characteristics. The EPP scheduling decisions are driven by the simulator's Prometheus metrics (KV-cache, queue depth), not by prompt content.
+
+### 5.2. Standard (IGW vs k8s Service)
+
+The foundational comparison — identical in structure to what the upstream GIE project publishes:
 
 | Scenario | Target | Routing |
 |----------|--------|---------|
 | **Scenario A** | kgateway + InferencePool (IGW) | EPP-aware scheduling |
 | **Scenario B** | kgateway + k8s LoadBalancer Service | Plain round-robin |
 
-Both target the same pool of model server pods. Multiple `inference-perf` instances run simultaneously for a fair comparison.
+- **Token shape:** Mixed lengths (general purpose, shareGPT-equivalent distribution)
+- **QPS stages:** 10 → 20 → 30
+- **Key metrics:** E2E latency (p50/p95/p99), throughput (tokens/sec), TTFT
 
-### 5.2. Prefix Cache Aware
+### 5.3. Prefill-Heavy
 
-Tests EPP's KV-cache-hit-aware scheduling. EPP preferentially routes requests with shared prompt prefixes to pods that have the prefix cached, reducing TTFT.
+Long input, short output — computationally expensive initial token generation (prefill phase). Stresses EPP's ability to avoid overloading pods already saturated with prefill work.
 
-- **Workload:** Requests with shared prompt prefixes (multi-turn conversations)
-- **What we measure:** TTFT improvement from cache hits vs random routing
-- **Key metric:** TTFT delta between IGW (cache-aware) and k8s service (random)
+- **Token shape:** Long input (~2000 tokens, billsum-equivalent), short output (~50 tokens)
+- **QPS stages:** 300 → 310 → 320 → 330 (high base rate; small increments to find saturation)
+- **Key metric:** TTFT p95/p99 as load increases
 
-### 5.3. Decode Heavy
+### 5.4. Decode-Heavy
 
-Sustained token generation workload — long output sequences relative to input. Stresses the EPP's queue-depth awareness as pods build up large generation queues.
+Short input, long output — sustained token generation. Stresses EPP's queue-depth awareness as model server pods accumulate long generation queues.
 
-- **Workload:** Short input (~50 tokens), long output (~500+ tokens)
-- **What we measure:** TPOT and ITL under sustained output load
-- **Key metric:** Throughput (tokens/sec) and tail TPOT at high concurrency
+- **Token shape:** Short input (~50 tokens), long output (~500+ tokens, infinity-instruct-equivalent)
+- **QPS stages:** 200 → 210 → 220
+- **Key metric:** TPOT and ITL under sustained decode load
 
-### 5.4. Prefill Heavy
+### 5.5. Prefix-Cache High (High Cache Hit Rate)
 
-Computationally expensive initial token generation — long input, short output. Stresses the EPP's awareness of prefill phase saturation.
+Designed to produce a **high EPP KV-cache hit rate**: requests share a long system prompt (2048 tokens) and a short per-request question (256 tokens). Most of the prompt is identical across requests, so EPP can route them to pods with the shared prefix already in cache.
 
-- **Workload:** Long input (~2000 tokens), short output (~50 tokens)
-- **What we measure:** TTFT under heavy prefill load
-- **Key metric:** TTFT p95/p99 at increasing concurrency
+- **Token shape:** system_prompt_len=2048, question_len=256
+- **QPS stages:** 100 → 300 → 500
+- **What we measure:** TTFT reduction from cache hits vs random routing (IGW vs k8s svc delta)
 
-### 5.5. Multi-LoRA
+### 5.6. Prefix-Cache Low (Low Cache Hit Rate)
 
-Multiple LoRA adapter variants served from the same pool. EPP routes based on which pods have the requested adapter loaded.
+Designed to produce a **low cache hit rate**: short system prompt (256 tokens) and long per-request question (2048 tokens). Most of each request is unique, so cache hits are rare. This measures the EPP overhead when cache-awareness doesn't help.
 
-- **Workload:** Mixed traffic across 2-4 different model names (each mapping to a LoRA adapter)
-- **What we measure:** Routing accuracy (requests land on correct adapter) and overhead of LoRA-aware scheduling
-- **Key metric:** Error rate + per-adapter TPOT
+- **Token shape:** system_prompt_len=256, question_len=2048
+- **QPS stages:** 100 → 300 → 500
+- **What we measure:** EPP scheduling overhead when cache is cold — how much does inference routing cost with no cache benefit?
 
-### 5.6. Load Profiles
+### 5.7. Multi-LoRA
 
-```mermaid
-graph LR
-    subgraph "Standard Ramp"
-        L1["Warm-up<br/>(low RPS, 60s)"] --> L2["Sustained<br/>(target RPS, 300s)"]
-        L2 --> L3["Saturation<br/>(increasing until error, 120s)"]
-        L3 --> L4["Cool-down<br/>(60s)"]
-    end
-```
+Mixed traffic across multiple LoRA adapters served from the same model server pool. EPP routes based on which pods have the requested adapter loaded. This tests EPP's LoRA-aware scheduling accuracy and overhead.
 
-`inference-perf` natively supports Gaussian, fixed, and min-max input/output token distributions. We use its built-in load profiles rather than custom implementations.
+- **Token shape:** Decode-heavy (infinity-instruct-equivalent), split across adapters
+- **Adapters:** Up to 15 LoRA adapters (matching upstream regression test scale)
+- **QPS stages:** 20 → 200
+- **Setup:** `lora-adapter-syncer` initContainer manages adapter lifecycle on model server pods
+- **Key metrics:** Per-adapter TPOT, routing accuracy (correct adapter hit rate), error rate
+
+### 5.8. Load Profiles
+
+Each profile uses `inference-perf`'s constant-rate executor with multi-stage QPS ramps (as above). No custom load generation code required — `inference-perf` handles this natively.
 
 ---
 
@@ -237,29 +294,45 @@ graph LR
 ### 6.1. Primary Benchmark Tool: `inference-perf`
 
 > [!TIP]
-> **Primary tool: [`kubernetes-sigs/inference-perf`](https://github.com/kubernetes-sigs/inference-perf)** — the official `wg-serving` GenAI benchmarking standard, already used by GIE's upstream benchmark.
+> **Primary tool: [`kubernetes-sigs/inference-perf`](https://github.com/kubernetes-sigs/inference-perf)** — the official `wg-serving` GenAI benchmarking standard, already used by GIE.
 
 | Why `inference-perf` | Detail |
 |----------|--------|
-| Official upstream tool | Used by GIE published benchmarks; ensures apples-to-apples comparison |
+| Official upstream tool | Used by GIE published benchmarks — ensures apples-to-apples comparison |
 | LLM-aware metrics natively | TPOT, ITL, TTFT built-in — no custom scripting needed |
-| Supports our 4 workload configs | Decode heavy, prefill heavy, prefix cache, multi-LoRA all supported |
+| Supports all 6 workload configs | Each config maps directly to an `inference-perf` YAML config |
 | Runs as a K8s Job | Inside-cluster traffic — no external network bias |
-| Multiple model server backends | vLLM, SGLang, TGI, llm-d, Inference Gateway |
-| Configurable load patterns | Burst, constant rate, scale to saturation |
+| Configurable token distributions | Replicate upstream workload *shapes* without real dataset downloads |
 
-**Why not k6?** k6 is excellent for HTTP API benchmarking but has no native concept of token distributions, LLM datasets, or LLM-specific metrics. We would reinvent what `inference-perf` already provides.
+**Deployment model (Helm):** The upstream uses a Helm chart at `benchmarking/inference-perf/` that produces per-run:
+- A **Job** running the `inference-perf` container with `--config_file /cfg/config.yml`
+- A **ConfigMap** containing the full YAML config (load stages, token distributions, server URL, metrics)
+- An optional **Secret** for HuggingFace tokens (not needed in our case — we use synthetic data)
+- An optional **initContainer** to pull datasets from GCS/S3 (not needed — we use synthetic data)
+
+We will adopt this same Helm chart pattern: **two Helm releases deployed in parallel**, one targeting the IGW and one targeting the k8s service baseline, for a simultaneous side-by-side comparison.
+
+**Why not k6?** k6 is great for HTTP API benchmarking but has no native concept of token distributions, LLM semantics, or multi-stage QPS ramps aligned with inference workloads. We'd reinvent what `inference-perf` already provides.
 
 ### 6.2. Regression Tool: Latency Profile Generator (LPG)
 
-The **Latency Profile Generator** is a separate upstream tool used specifically for **regression testing** — it generates a controlled latency profile to detect performance degradation between kgateway versions.
+The **Latency Profile Generator** (from `AI-Hypercomputer/inference-benchmark`) is used specifically for **regression testing** — it catches performance degradation between kgateway versions quickly, without running the full benchmark suite.
 
-| Feature | Description |
-|---------|-------------|
-| **Purpose** | Detect regressions (not measure peak performance) |
-| **Use in CI** | Run on every PR against `main`; fast, deterministic |
+| Feature | Detail |
+|---------|--------|
+| **Purpose** | Detect regressions, not measure peak performance |
+| **Use in CI** | PR-level: fast, deterministic pass/fail |
 | **Output** | Pass/fail against stored latency profiles |
-| **Complement** | Works alongside `inference-perf` — perf benchmarks measure absolutes; LPG catches regressions |
+| **Complements inference-perf** | `inference-perf` measures absolutes on nightly/release; LPG catches regressions on PRs |
+
+**Upstream LPG regression test cases** (we adopt both):
+
+| Regression Test | Workload | Dataset shape | QPS | Replicas |
+|----------------|----------|--------------|-----|----------|
+| **Single workload** | Prefill-heavy | billsum-equivalent (~2000 token input) | 300–350 | 10 |
+| **Multi-LoRA** | Decode-heavy | infinity-instruct-equivalent | 20–200 | 10 + 15 adapters |
+
+The Multi-LoRA regression test uses `lora-adapter-syncer` as an initContainer sidecar to manage loading/unloading 15 LoRA adapters on each model server pod — the same setup `llm-d-inference-sim` supports via its LoRA lifecycle simulation.
 
 ### 6.3. Model Server: `llm-d-inference-sim`
 
@@ -271,15 +344,25 @@ The **Latency Profile Generator** is a separate upstream tool used specifically 
 
 > 8-10 replicas recommended by the upstream team for meaningful EPP routing decisions (EPP needs enough pods to have scheduling choices).
 
-### 6.4. Storage Options
+### 6.4. Result Extraction and Storage
 
-| Storage | When to Use |
-|---------|-------------|
-| **Local** (default) | Local dev / PR-level runs; results lost when pod terminates |
-| **Google Cloud Storage (GCS)** | Nightly / release runs; persistent, queryable history |
-| **AWS S3** | Alternative to GCS for AWS-hosted CI |
+`inference-perf` runs as a Kubernetes Job and writes its output JSON **inside the pod filesystem**. Because the Kind cluster is deleted after every benchmark run, results must be extracted to the host **before teardown**.
 
-For GSoC core we start with **local + GitHub Actions artifact upload**. GCS/S3 integration is implemented as part of the CI workflow for release runs.
+**Extraction mechanism (Go harness):**
+```go
+// results.go — called before teardown
+kubectl cp inference-perf-job-pod:/results/output.json \
+    ./test/benchmark/results/inference-perf-<timestamp>.json
+```
+
+| Location | When | How |
+|----------|------|-----|
+| `test/benchmark/results/` (host) | Always — local dev and CI | `kubectl cp` before cluster teardown |
+| GitHub Actions artifact | CI runs | Uploaded from host path post-teardown |
+| Google Cloud Storage | Nightly + release CI | Uploaded from host path; long-term history |
+| AWS S3 | Alternative to GCS | Same approach |
+
+For GSoC core: **host extraction + GitHub Actions artifact**. GCS/S3 upload added in the CI workflow phase.
 
 ---
 
