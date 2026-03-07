@@ -4,9 +4,9 @@
 
 - [1. Project Overview](#1-project-overview)
 - [2. Background and Context](#2-background-and-context)
-- [3. Architecture Deep-Dive](#3-architecture-deep-dive)
+- [3. Test Setup Architecture](#3-test-setup-architecture)
 - [4. Scope: GSoC Core vs Stretch Goals](#4-scope-gsoc-core-vs-stretch-goals)
-- [5. Benchmark Design](#5-benchmark-design)
+- [5. Benchmark Configurations](#5-benchmark-configurations)
 - [6. Tools Selection and Analysis](#6-tools-selection-and-analysis)
 - [7. Implementation Plan](#7-implementation-plan)
 - [8. Metrics and Data Collection](#8-metrics-and-data-collection)
@@ -21,30 +21,25 @@
 
 ### Problem Statement
 
-kgateway provides inference routing capabilities via the [Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension) (GIE). This integration enables model-aware routing, serving priority, and customizable load-balancing of self-hosted Generative AI models through Envoy's External Processing (ext_proc) filter.
+kgateway provides inference routing capabilities via the [Gateway API Inference Extension](https://github.com/kubernetes-sigs/gateway-api-inference-extension) (GIE), enabling model-aware routing of self-hosted GenAI models through Envoy's `ext_proc` filter. There is currently **no standardized or reproducible way** to evaluate the performance impact of these extensions in kgateway:
 
-There is currently **no standardized or reproducible way** to evaluate the performance impact of these inference routing extensions in kgateway. Specifically:
-- No published benchmarks comparing kgateway (with inference extension) vs a standard Kubernetes service
-- No reproducible test environment (script/automation) for users to validate results themselves
-- No CI job running inference performance tests against the main branch
+- No published benchmarks comparing **kgateway + inference extension** vs **plain k8s Service**
+- No reproducible test environment script for users to validate results
+- No periodic CI job for inference perf regression testing
 - No integration of perf regressions into the release process
 
 ### Goals
 
-1. Publish reproducible benchmarks (TPOT, ITL, TTFT, E2E latency) comparing **kgateway + inference extension** vs **standard k8s service**
-2. Build a **reproducible test environment** via scripts so users can validate benchmarks themselves
-3. Implement **CI automation** (nightly/weekly) to run benchmarks against the `main` branch
-4. Integrate benchmarks into the **release process** to prevent regressions from shipping
-5. Document benchmark methodology, interpretation, and best practices
+1. Publish benchmarks (**TPOT, ITL, TTFT, E2E latency**) comparing kgateway inference routing vs plain k8s service
+2. Build **reproducible environment setup scripts** so users can validate results themselves
+3. Implement a **periodic CI job** (nightly/weekly) against the `main` branch
+4. Integrate benchmarks into the **release process** to gate on regressions
+5. Document methodology and interpretation
 
 ### Relationship to Existing Work
 
 > [!IMPORTANT]
-> This project is complementary to the existing control-plane load testing framework design ([design/11210](file:///home/shubham/Code/Personal/kgateway/design/11210-kgateway-load-testing-framework.md)), which focuses on route attachment/propagation times. **This proposal focuses on data-plane inference performance** — token latency, throughput, and routing overhead — using real or simulated GPU workloads.
-
-### Reference: Upstream Benchmark
-
-The GIE project already publishes benchmarks at [gateway-api-inference-extension.sigs.k8s.io/performance/benchmark](https://gateway-api-inference-extension.sigs.k8s.io/performance/benchmark/) using the [`inference-perf`](https://github.com/kubernetes-sigs/inference-perf) tool. Our goal is to build **kgateway-specific benchmarks** following the same methodology — referencing the upstream tool and integrating results into kgateway's own docs and release pipeline.
+> This is complementary to [design/11210](file:///home/shubham/Code/Personal/kgateway/design/11210-kgateway-load-testing-framework.md) (control-plane scale testing). This proposal targets **data-plane inference performance** — token latency, throughput, and routing overhead — following the same methodology as the [GIE upstream benchmark](https://gateway-api-inference-extension.sigs.k8s.io/performance/benchmark/).
 
 ---
 
@@ -52,286 +47,239 @@ The GIE project already publishes benchmarks at [gateway-api-inference-extension
 
 ### What is the Gateway API Inference Extension (GIE)?
 
-The GIE transforms any ext-proc-capable gateway (like kgateway/Envoy) into an **Inference Gateway** optimized for serving Generative AI workloads.
-
-**Key Components:**
-
 | Component | Description |
 |-----------|-------------|
-| **InferencePool** | K8s CRD defining a pool of model-serving backends (e.g., vLLM pods) |
-| **Endpoint Picker (EPP)** | ext_proc server selecting the optimal backend based on KV-cache state, LoRA availability, request cost |
-| **Body Based Router (BBR)** | Optional ext_proc server parsing request bodies to extract model names for routing |
-| **InferenceModel** | CRD mapping client-facing model names to backend-specific models/adapters |
+| **InferencePool** | K8s CRD defining a pool of model-serving backends |
+| **Endpoint Picker (EPP)** | ext_proc server selecting optimal backends via KV-cache/LoRA/queue-depth awareness |
+| **Body Based Router (BBR)** | Optional ext_proc server parsing request bodies for model-name routing |
+| **InferenceModel** | CRD mapping client model names to backend models/LoRA adapters |
 
 ### How kgateway Integrates GIE
-
-Based on [design/10411](file:///home/shubham/Code/Personal/kgateway/design/10411-gateway-api-inference-extension-support.md):
-- GIE is implemented as a **kgateway plugin**
-- The plugin manages Envoy's **External Processing Filter** (ext_proc) to route requests through the EPP
-- **InferencePool** is a supported HTTPRoute backend reference
-- A dedicated **deployer** manages EPP resources
-
-### kgateway Architecture (Translation Pipeline)
 
 ```mermaid
 flowchart LR
     subgraph "Phase 1: Policy -> IR"
-        CRD["Policy CRDs<br/>(TrafficPolicy,<br/>InferencePool)"]
-        PIR["PolicyIR<br/>(close to Envoy protos)"]
-        CRD --> PIR
+        CRD["InferencePool CRD"] --> PIR["PolicyIR"]
     end
-
-    subgraph "Phase 2: Route/GW -> IR"
-        HR["HTTPRoute +<br/>Gateway"]
-        GIR["Gateway IR<br/>(Routes + Attached Policies)"]
-        HR --> GIR
-        PIR -.->|"policy attachment<br/>via targetRefs"| GIR
+    subgraph "Phase 2: Route -> IR"
+        HR["HTTPRoute"] --> GIR["Gateway IR"]
+        PIR -.->|"targetRef attachment"| GIR
     end
-
     subgraph "Phase 3: IR -> xDS"
-        GIR --> xDS["Envoy xDS Config<br/>(listeners, routes,<br/>clusters, ext_proc)"]
+        GIR --> xDS["Envoy xDS Config<br/>(routes + ext_proc filter)"]
     end
-
     xDS --> Envoy["Envoy Proxy"]
 ```
 
 ---
 
-## 3. Architecture Deep-Dive
+## 3. Test Setup Architecture
 
-### Inference Request Flow (What We Are Benchmarking)
-
-```mermaid
-sequenceDiagram
-    participant Client as inference-perf<br/>(load generator)
-    participant Envoy as Envoy Proxy<br/>(kgateway data plane)
-    participant BBR as Body Based Router<br/>(ext_proc - optional)
-    participant EPP as Endpoint Picker<br/>(ext_proc)
-    participant Model as Model Server<br/>(vLLM / llm-d-inference-sim)
-
-    Client->>Envoy: POST /v1/chat/completions
-
-    Note over Envoy: Route matches InferencePool backend
-
-    opt BBR Enabled
-        Envoy->>BBR: ext_proc: ProcessingRequest
-        BBR->>Envoy: ext_proc: ProcessingResponse (model name)
-    end
-
-    Envoy->>EPP: ext_proc: ProcessingRequest
-    Note over EPP: Schedule: KV-cache, LoRA, queue depth
-    EPP->>Envoy: ext_proc: ProcessingResponse (endpoint)
-
-    Envoy->>Model: Forward request
-    Model-->>Envoy: Inference response (stream or full)
-    Envoy-->>Client: HTTP Response
-```
-
-### Benchmark Architecture
+This diagram shows how all components connect during a benchmark run. It mirrors the GIE upstream approach with kgateway-specific additions.
 
 ```mermaid
 flowchart TB
     subgraph "Load Generation"
-        IP["inference-perf<br/>(kubernetes-sigs/inference-perf)"]
+        IP["inference-perf<br/>(Kubernetes Job)"]
+        LPG["Latency Profile Generator<br/>(regression testing)"]
     end
 
-    subgraph "Kubernetes Cluster"
+    subgraph "Kubernetes Cluster (GKE / Kind)"
+
         subgraph "Gateway Layer"
             GW["kgateway Controller"]
-            EP["Envoy Proxy"]
+            ENV["Envoy Proxy<br/>(data plane)"]
+            GW -.->|"xDS config"| ENV
         end
 
-        subgraph "Inference Layer"
-            EPP_D["EPP Deployment"]
-            BBR_D["BBR (optional)"]
+        subgraph "Inference Extension Layer"
+            EPP["Endpoint Picker<br/>(ext_proc server)"]
+            BBR["Body Based Router<br/>(optional)"]
         end
 
-        subgraph "Model Servers"
+        subgraph "Target A: Inference Gateway"
+            IGW_RT["HTTPRoute → InferencePool"]
+        end
+
+        subgraph "Target B: Baseline"
+            K8S_SVC["HTTPRoute → k8s Service<br/>(round-robin LB)"]
+        end
+
+        subgraph "Model Servers  ×8-10 replicas"
             MS1["vLLM / llm-d-inference-sim #1"]
             MS2["vLLM / llm-d-inference-sim #2"]
-            MS3["vLLM / llm-d-inference-sim #3"]
-        end
-
-        subgraph "Comparison Target"
-            K8S["Plain k8s Service<br/>(round-robin)"]
+            MSN["vLLM / llm-d-inference-sim #N"]
         end
 
         subgraph "Observability"
             PROM["Prometheus"]
-            CM["cAdvisor"]
+            CA["cAdvisor"]
         end
     end
 
-    subgraph "Results"
-        RP["Results Processor"]
-        PUB["Published Benchmarks<br/>(kgateway website)"]
-        GCS["Cloud Storage<br/>(GCS / S3)"]
+    subgraph "Result Storage"
+        LOCAL["Local (pod filesystem)"]
+        GCS["Google Cloud Storage"]
+        S3["AWS S3"]
     end
 
-    IP -->|"HTTP requests (scenario A)"| EP
-    IP -->|"HTTP requests (scenario B)"| K8S
-    EP <-->|"ext_proc gRPC"| EPP_D
-    EP --> MS1 & MS2 & MS3
-    K8S --> MS1 & MS2 & MS3
-    PROM -.->|"scrape"| EP & EPP_D & CM
-    RP --> PUB & GCS
+    IP -->|"POST /v1/chat/completions<br/>(Scenario A)"| IGW_RT
+    IP -->|"POST /v1/chat/completions<br/>(Scenario B)"| K8S_SVC
+    LPG -->|"regression load"| IGW_RT
+
+    IGW_RT --> ENV
+    ENV <-->|"ext_proc gRPC"| EPP
+    ENV <-->|"ext_proc gRPC (opt)"| BBR
+    ENV --> MS1 & MS2 & MSN
+
+    K8S_SVC --> MS1 & MS2 & MSN
+
+    EPP -.->|"metrics scrape"| MS1 & MS2 & MSN
+    PROM -.->|"scrape"| ENV & EPP & CA
+
+    IP -->|"results JSON"| LOCAL
+    LOCAL -.->|"optional upload"| GCS & S3
 ```
+
+> [!NOTE]
+> **What we are NOT including:** Jupyter notebook analysis, HuggingFace dataset downloads, or Looker Studio dashboards. These are part of the upstream GIE project's internal tooling. Our reporting will use Go-generated Markdown + JSON summaries, consistent with kgateway's existing test infrastructure.
 
 ---
 
 ## 4. Scope: GSoC Core vs Stretch Goals
 
-> [!IMPORTANT]
-> The upstream issue includes requirements that need significant infrastructure (cloud GPU access, website publishing pipeline). We split these into **GSoC core deliverables** and **stretch goals** that can be pursued after the foundation is in place.
+| # | GSoC Core (6 Weeks) | Description |
+|---|---------------------|-------------|
+| 1 | Reproducible setup scripts | One-command env setup using `llm-d-inference-sim` (no GPU) |
+| 2 | `inference-perf` integration | Configure and wire up for kgateway-specific scenarios |
+| 3 | IGW vs k8s service comparison | Side-by-side benchmark with TPOT/ITL/TTFT metrics |
+| 4 | LPG regression testing | Latency Profile Generator for CI regression detection |
+| 5 | 4 upstream test configs | Prefix Cache Aware, Decode Heavy, Prefill Heavy, Multi-LoRA |
+| 6 | Result storage (local + GCS/S3) | Store JSON results; upload to cloud on release runs |
+| 7 | Periodic CI job (nightly) | GitHub Actions workflow against `main` branch |
+| 8 | Markdown + JSON reporting | Go-generated report; no Jupyter or external dashboards |
+| 9 | Documentation | Methodology, how to reproduce, result interpretation |
 
-### GSoC Core Deliverables (6 Weeks)
-
-| # | Deliverable | Description |
-|---|------------|-------------|
-| 1 | **Reproducible benchmark scripts** | One-command setup using `llm-d-inference-sim` (no GPU needed) |
-| 2 | **inference-perf integration** | Wire up the upstream tool for kgateway-specific scenarios |
-| 3 | **Comparison: IGW vs k8s service** | Side-by-side benchmarks with published results |
-| 4 | **Metrics: TPOT, ITL, TTFT, E2E** | LLM-specific metrics matching upstream benchmark format |
-| 5 | **CI job (nightly)** | GitHub Actions workflow against `main` branch |
-| 6 | **Result storage + basic reporting** | Store JSON results as artifacts; generate Markdown summary |
-| 7 | **Documentation** | Methodology, interpretation guide, how to reproduce |
-
-### Stretch Goals (Beyond GSoC, or bonus if time allows)
-
-| # | Stretch Goal | Description | Blocker |
-|---|-------------|-------------|---------|
-| S1 | **Real GPU test env (B100)** | Run on latest cloud GPUs from major providers | Needs cloud GPU quota/budget |
-| S2 | **Published benchmark page** | Integrate results into kgateway website (like GIE does) | Needs website infra access |
-| S3 | **Release process gate** | Block kgateway releases on perf regressions | Needs maintainer sign-off on thresholds |
-| S4 | **llm-d perf test integration** | Investigate and cross-reference with `llm-d` benchmarks | Depends on llm-d project stability |
-| S5 | **GPU utilization metrics** | Accelerator-level metrics (GPU util, memory, power) | Needs `inference-perf` roadmap feature |
+| # | Stretch Goal | Blocker |
+|---|-------------|---------|
+| S1 | Real GPU env (B100 / H100 80GB, 8-10 replicas) | Cloud GPU budget / OSS credits |
+| S2 | GKE-based e2e workflows (like upstream) | GPU env (S1) |
+| S3 | Published benchmark page on kgateway website | Website infra access |
+| S4 | Release process regression gate | Maintainer sign-off on thresholds |
+| S5 | GPU utilization metrics | `inference-perf` roadmap |
 
 ---
 
-## 5. Benchmark Design
+## 5. Benchmark Configurations
 
-### 5.1. Primary Comparison: IGW vs k8s Service
+We adopt the same four configurations as the upstream GIE benchmark, tailored for kgateway.
 
-This directly mirrors the [upstream GIE benchmark](https://gateway-api-inference-extension.sigs.k8s.io/performance/benchmark/):
+### 5.1. Standard Comparison (IGW vs k8s Service)
 
-| Scenario | Target | Description |
-|----------|--------|-------------|
-| **Scenario A** | kgateway + InferencePool (IGW) | Inference-aware routing via EPP |
-| **Scenario B** | kgateway + plain k8s Service | Standard round-robin load balancing |
+The foundational benchmark — identical to what the upstream GIE project publishes:
 
-Both scenarios send traffic to **the same pool of model server pods**, but differ in how the gateway routes them. Running both simultaneously via separate `inference-perf` instances allows a fair apples-to-apples comparison.
+| Scenario | Target | Routing |
+|----------|--------|---------|
+| **Scenario A** | kgateway + InferencePool (IGW) | EPP-aware scheduling |
+| **Scenario B** | kgateway + k8s LoadBalancer Service | Plain round-robin |
 
-### 5.2. Additional Scenarios (Beyond Upstream)
+Both target the same pool of model server pods. Multiple `inference-perf` instances run simultaneously for a fair comparison.
 
-These go deeper than the upstream GIE benchmark, providing kgateway-specific insights:
+### 5.2. Prefix Cache Aware
 
-#### EPP Configuration Variations
+Tests EPP's KV-cache-hit-aware scheduling. EPP preferentially routes requests with shared prompt prefixes to pods that have the prefix cached, reducing TTFT.
 
-| Configuration | Description |
-|--------------|-------------|
-| **Default EPP** | Standard scheduling with queue-depth awareness |
-| **EPP + BBR** | Body Based Router adds model-name extraction |
-| **LoRA-aware EPP** | Routing to pods with specific LoRA adapters loaded |
-| **Multi-InferenceModel** | Multiple model→adapter mappings in one pool |
+- **Workload:** Requests with shared prompt prefixes (multi-turn conversations)
+- **What we measure:** TTFT improvement from cache hits vs random routing
+- **Key metric:** TTFT delta between IGW (cache-aware) and k8s service (random)
 
-#### Workload Variations
+### 5.3. Decode Heavy
 
-| Workload | Input/Output | Notes |
-|----------|-------------|-------|
-| **Short prompt** | ~100 input / 100 output tokens | Fast, frequent requests |
-| **Long context** | ~2000 input / 200 output tokens | Tests KV-cache scheduling |
-| **Streaming** | Any | Tests TTFT and inter-chunk latency |
-| **Multi-turn chat** | Shared prefix | Tests prefix-cache-aware scheduling |
-| **Multi-LoRA** | Mixed adapter traffic | Tests LoRA scheduling |
+Sustained token generation workload — long output sequences relative to input. Stresses the EPP's queue-depth awareness as pods build up large generation queues.
 
-### 5.3. Load Profiles
+- **Workload:** Short input (~50 tokens), long output (~500+ tokens)
+- **What we measure:** TPOT and ITL under sustained output load
+- **Key metric:** Throughput (tokens/sec) and tail TPOT at high concurrency
+
+### 5.4. Prefill Heavy
+
+Computationally expensive initial token generation — long input, short output. Stresses the EPP's awareness of prefill phase saturation.
+
+- **Workload:** Long input (~2000 tokens), short output (~50 tokens)
+- **What we measure:** TTFT under heavy prefill load
+- **Key metric:** TTFT p95/p99 at increasing concurrency
+
+### 5.5. Multi-LoRA
+
+Multiple LoRA adapter variants served from the same pool. EPP routes based on which pods have the requested adapter loaded.
+
+- **Workload:** Mixed traffic across 2-4 different model names (each mapping to a LoRA adapter)
+- **What we measure:** Routing accuracy (requests land on correct adapter) and overhead of LoRA-aware scheduling
+- **Key metric:** Error rate + per-adapter TPOT
+
+### 5.6. Load Profiles
 
 ```mermaid
 graph LR
-    subgraph "Load Ramp Profile"
-        L1["Warm-up<br/>low RPS<br/>30s"]
-        L2["Sustained<br/>medium RPS<br/>120s"]
-        L3["Saturation<br/>scale to max<br/>60s"]
-        L4["Cool-down<br/>30s"]
-        L1 --> L2 --> L3 --> L4
+    subgraph "Standard Ramp"
+        L1["Warm-up<br/>(low RPS, 60s)"] --> L2["Sustained<br/>(target RPS, 300s)"]
+        L2 --> L3["Saturation<br/>(increasing until error, 120s)"]
+        L3 --> L4["Cool-down<br/>(60s)"]
     end
 ```
 
-`inference-perf` supports Gaussian, fixed-length, and min-max input/output distributions, plus burst traffic patterns. We will use its built-in load profiles rather than custom ones.
-
-### 5.4. Model Server: `llm-d-inference-sim` (No GPU Required)
-
-For the core GSoC deliverables, we use [`llm-d/llm-d-inference-sim`](https://github.com/llm-d/llm-d-inference-sim) instead of building a mock server from scratch. It provides:
-
-- OpenAI-compatible `/v1/chat/completions` (HTTP + gRPC)
-- Realistic TTFT simulation (prefill phase latency with jitter)
-- Realistic inter-token latency (decode phase)
-- Load-adaptive latency (gets slower under concurrency, like real vLLM)
-- vLLM-compatible Prometheus `/metrics` (KV-cache, queue depth, LoRA)
-- LoRA adapter lifecycle simulation
-- Docker image available — load into Kind directly
-
-This saves ~1.5 weeks of work compared to writing a mock server and gives the EPP **real signals to make scheduling decisions**, making the benchmark more meaningful.
-
-> [!NOTE]
-> For Stretch Goal S1 (real GPU env), replace `llm-d-inference-sim` with actual vLLM instances running on B100 nodes. The rest of the framework is identical.
+`inference-perf` natively supports Gaussian, fixed, and min-max input/output token distributions. We use its built-in load profiles rather than custom implementations.
 
 ---
 
 ## 6. Tools Selection and Analysis
 
-### 6.1. Primary Load Generation: `inference-perf`
+### 6.1. Primary Benchmark Tool: `inference-perf`
 
 > [!TIP]
-> **We align with the upstream choice: [`kubernetes-sigs/inference-perf`](https://github.com/kubernetes-sigs/inference-perf)** — the standardized GenAI inference benchmarking tool from the Kubernetes `wg-serving` working group.
+> **Primary tool: [`kubernetes-sigs/inference-perf`](https://github.com/kubernetes-sigs/inference-perf)** — the official `wg-serving` GenAI benchmarking standard, already used by GIE's upstream benchmark.
 
-**Why `inference-perf`?**
+| Why `inference-perf` | Detail |
+|----------|--------|
+| Official upstream tool | Used by GIE published benchmarks; ensures apples-to-apples comparison |
+| LLM-aware metrics natively | TPOT, ITL, TTFT built-in — no custom scripting needed |
+| Supports our 4 workload configs | Decode heavy, prefill heavy, prefix cache, multi-LoRA all supported |
+| Runs as a K8s Job | Inside-cluster traffic — no external network bias |
+| Multiple model server backends | vLLM, SGLang, TGI, llm-d, Inference Gateway |
+| Configurable load patterns | Burst, constant rate, scale to saturation |
 
-| Reason | Detail |
-|--------|--------|
-| **Official upstream tool** | Used by GIE for their published benchmarks; aligns kgateway with community standards |
-| **LLM-aware metrics** | Natively measures TPOT, ITL, TTFT, E2E latency — not retrofitted |
-| **Model-server agnostic** | Works with vLLM, SGLang, TGI, llm-d, Inference Gateway |
-| **Real-world datasets** | ShareGPT, HuggingFace datasets; Gaussian/fixed/min-max distributions |
-| **Built-in load patterns** | Burst traffic, scaling to saturation, multi-LoRA traffic splitting |
-| **Multi-turn conversations** | Maintains prefix context across turns (critical for KV-cache testing) |
-| **Deployment as K8s Job** | Runs inside the cluster — accurate latency, no external network overhead |
+**Why not k6?** k6 is excellent for HTTP API benchmarking but has no native concept of token distributions, LLM datasets, or LLM-specific metrics. We would reinvent what `inference-perf` already provides.
 
-**Alternative: k6**
+### 6.2. Regression Tool: Latency Profile Generator (LPG)
 
-k6 is a general-purpose HTTP load generator. It is excellent for gateway/API benchmarking but:
-- Does not natively understand LLM semantics (TPOT, ITL require custom metric definitions)
-- Has no concept of token distributions or chat datasets
-- Would require significant custom scripting to match what `inference-perf` does out-of-the-box
+The **Latency Profile Generator** is a separate upstream tool used specifically for **regression testing** — it generates a controlled latency profile to detect performance degradation between kgateway versions.
 
-> **Decision:** Use `inference-perf` as the primary tool for all LLM inference benchmarks. A lightweight Go test harness orchestrates the setup/teardown and wraps `inference-perf` invocations. For gateway-specific HTTP benchmarks (routing overhead without LLM context), `vegeta` or a simple Go HTTP client can supplement.
+| Feature | Description |
+|---------|-------------|
+| **Purpose** | Detect regressions (not measure peak performance) |
+| **Use in CI** | Run on every PR against `main`; fast, deterministic |
+| **Output** | Pass/fail against stored latency profiles |
+| **Complement** | Works alongside `inference-perf` — perf benchmarks measure absolutes; LPG catches regressions |
 
-### 6.2. Model Server: `llm-d-inference-sim`
+### 6.3. Model Server: `llm-d-inference-sim`
 
-| Option | Pros | Cons |
-|--------|------|------|
-| **`llm-d-inference-sim`** (recommended) | Physics-based latency sim, real vLLM metrics, LoRA support, GPU-free, maintained by GIE ecosystem | External dependency |
-| **GIE's own vLLM sim** | Simpler, directly from upstream | Less realistic; limited metric simulation |
-| **Custom Go mock server** | Full control, no dependency | ~1.5 weeks of work; less realistic EPP signals |
-| **Real vLLM (GPU)** | Most realistic | Requires GPU hardware; not available in CI |
+| Option | Use case | Pros | Cons |
+|--------|----------|------|------|
+| **`llm-d-inference-sim`** (core) | CI / local dev (no GPU) | GPU-free, realistic vLLM metrics, LoRA sim, physics-based latency | External image dependency |
+| **vLLM (H100 80GB) ×8-10** (stretch) | GPU env / release validation | Most realistic | Requires cloud GPU budget |
+| GIE's simple vLLM sim | Quick integration test | Minimal dep | No real EPP signal quality |
 
-**Decision:** `llm-d-inference-sim` for core work; real vLLM as a stretch goal.
+> 8-10 replicas recommended by the upstream team for meaningful EPP routing decisions (EPP needs enough pods to have scheduling choices).
 
-### 6.3. Metrics Collection: Prometheus
+### 6.4. Storage Options
 
-| Component | Purpose |
-|-----------|---------|
-| **Prometheus** | Scrape Envoy, EPP, model server, cAdvisor |
-| **cAdvisor** | Container-level CPU/memory overhead |
-| **`inference-perf` built-in** | LLM metrics (TPOT, ITL, TTFT) natively reported |
+| Storage | When to Use |
+|---------|-------------|
+| **Local** (default) | Local dev / PR-level runs; results lost when pod terminates |
+| **Google Cloud Storage (GCS)** | Nightly / release runs; persistent, queryable history |
+| **AWS S3** | Alternative to GCS for AWS-hosted CI |
 
-### 6.4. Result Storage
-
-| Location | Use Case |
-|----------|----------|
-| **GitHub Actions Artifacts** | Per-run results (immediate, no external dependency) |
-| **Cloud Storage (GCS/S3)** | Long-term historical storage for trend analysis *(stretch goal)* |
-| **kgateway website** | Published benchmark page *(stretch goal)* |
+For GSoC core we start with **local + GitHub Actions artifact upload**. GCS/S3 integration is implemented as part of the CI workflow for release runs.
 
 ---
 
@@ -342,142 +290,117 @@ k6 is a general-purpose HTTP load generator. It is excellent for gateway/API ben
 ```
 test/
   benchmark/
-    README.md                              # Quick start and overview
-    Makefile                               # make benchmark, make benchmark-baseline, etc.
+    README.md
+    Makefile
     setup/
-      kind-cluster.sh                      # Reproducible cluster setup script
-      install-kgateway.sh                  # kgateway install with inference extension enabled
-      install-inference-perf.sh            # inference-perf tool setup
+      cluster-kind.sh             # Reproducible Kind cluster (no GPU)
+      cluster-gke.sh              # GKE cluster with GPU nodes (stretch)
+      install-kgateway.sh         # kgateway + inference extension enabled
+      install-inference-perf.sh   # inference-perf + LPG install
     manifests/
-      gateway-igw.yaml                     # Gateway + HTTPRoute -> InferencePool (Scenario A)
-      gateway-k8s-svc.yaml                 # Gateway + HTTPRoute -> Service (Scenario B)
-      inferencepool.yaml                   # InferencePool + InferenceModel CRDs
-      llm-d-sim.yaml                       # llm-d-inference-sim Deployment + Service
-      epp.yaml                             # EPP Deployment + Service
-      prometheus.yaml                      # Prometheus stack
+      gateway-igw.yaml            # Gateway + HTTPRoute -> InferencePool (Scenario A)
+      gateway-k8s-svc.yaml        # Gateway + HTTPRoute -> Service (Scenario B)
+      inferencepool.yaml          # InferencePool + InferenceModel
+      epp.yaml                    # EPP Deployment + Service
+      llm-d-sim.yaml              # llm-d-inference-sim Deployment (×3, no-GPU)
+      prometheus.yaml             # Prometheus stack
     inference-perf/
-      config-igw.yaml                      # inference-perf config for Scenario A
-      config-k8s-svc.yaml                  # inference-perf config for Scenario B
-      config-multilora.yaml                # Multi-LoRA workload config
-      config-streaming.yaml                # Streaming workload config
+      config-standard.yaml        # Basic IGW vs k8s service
+      config-prefix-cache.yaml    # Prefix cache aware workload
+      config-decode-heavy.yaml    # Decode heavy workload
+      config-prefill-heavy.yaml   # Prefill heavy workload
+      config-multilora.yaml       # Multi-LoRA workload
+    lpg/
+      config-regression.yaml      # LPG regression test config
+      profiles/
+        baseline-profile.json     # Committed latency profile for regression detection
     harness/
-      benchmark_test.go                    # Go test entry points (testify)
-      setup.go                             # Cluster + resource setup
-      teardown.go                          # Cleanup
-      results.go                           # Results collection + comparison
-      report.go                            # Markdown report generation
+      benchmark_test.go           # Go test entry points
+      setup.go                    # Cluster + resource setup
+      teardown.go                 # Cleanup
+      results.go                  # Results collection (inference-perf JSON + Prometheus)
+      report.go                   # Markdown + JSON report generation
+      storage.go                  # Upload results to GCS / S3
     results/
       baseline/
-        benchmark-results.json             # Committed baseline for regression detection
+        benchmark-results.json    # Committed baseline for GSoC-era comparison
     docs/
       methodology.md
       interpreting-results.md
+      reproducing.md
       best-practices.md
 ```
 
-### 7.2. `inference-perf` Configuration
-
-`inference-perf` is config-driven (YAML). Example for the IGW scenario:
-
-```yaml
-# inference-perf/config-igw.yaml
-server:
-  base_url: "http://${GATEWAY_IP}:${GATEWAY_PORT}"  # kgateway Envoy address
-
-dataset:
-  type: "sharegpt"                         # Real-world conversation dataset
-  path: "ShareGPT_V3_unfiltered_cleaned_split.json"
-
-load:
-  mode: "constant_rate"
-  rate: 50                                  # requests/sec
-  duration: "300s"
-
-tokenizer:
-  model: "meta-llama/Llama-2-7b-chat-hf"   # For accurate token counting
-
-output:
-  storage: "local"
-  path: "/results/igw-benchmark.json"
-```
-
-### 7.3. Go Test Harness (Orchestrator)
-
-```mermaid
-flowchart TD
-    subgraph "Go Benchmark Harness"
-        S["Setup Phase"]
-        B["Benchmark Phase"]
-        C["Collection Phase"]
-        R["Report Phase"]
-        T["Teardown Phase"]
-    end
-
-    S --> |"1. Create cluster<br/>2. Install kgateway<br/>3. Deploy llm-d-sim + EPP<br/>4. Apply CRDs + Gateway<br/>5. Deploy Prometheus"| B
-    B --> |"1. Run inference-perf (IGW scenario)<br/>2. Run inference-perf (k8s svc scenario)<br/>3. Collect Prometheus snapshots"| C
-    C --> |"1. Parse inference-perf JSON<br/>2. Query Prometheus for resource metrics<br/>3. Compute deltas"| R
-    R --> |"1. Generate Markdown report<br/>2. Generate JSON summary<br/>3. Compare against baseline"| T
-    T --> |"1. Delete resources<br/>2. Delete cluster"| DONE["Done"]
-```
-
-### 7.4. Benchmark Execution Flow
+### 7.2. Benchmark Execution Flow
 
 ```mermaid
 flowchart LR
     subgraph "1. Setup"
-        K["Kind Cluster"] --> KG["kgateway + GIE CRDs"]
-        KG --> MS["llm-d-inference-sim x3"]
-        MS --> EPP["EPP Deployment"]
-        EPP --> BOTH["Gateway A (IGW)<br/>Gateway B (k8s svc)"]
+        S1["Create cluster<br/>(Kind or GKE)"]
+        S2["Install kgateway<br/>+ GIE CRDs"]
+        S3["Deploy llm-d-sim<br/>×3 (or vLLM ×8-10)"]
+        S4["Deploy EPP"]
+        S5["Create Gateways<br/>A (IGW) + B (k8s svc)"]
+        S1 --> S2 --> S3 --> S4 --> S5
     end
 
-    subgraph "2. Run Benchmarks"
-        PA["inference-perf<br/>→ IGW (Scenario A)"]
-        PB["inference-perf<br/>→ k8s svc (Scenario B)"]
-        PA & PB --> COLLECT["Collect results<br/>from both"]
+    subgraph "2. Benchmark"
+        B1["Run inference-perf<br/>→ IGW (A)"]
+        B2["Run inference-perf<br/>→ k8s svc (B)"]
+        B3["Run LPG<br/>(regression check)"]
+        B1 & B2 & B3
     end
 
-    subgraph "3. Report"
-        COLLECT --> COMPARE["Compare TPOT, ITL,<br/>TTFT, throughput"]
-        COMPARE --> REPORT["Markdown + JSON report"]
+    subgraph "3. Collect"
+        C1["Parse inference-perf JSON"]
+        C2["Query Prometheus<br/>(resource overhead)"]
+        C3["Compute deltas<br/>(A vs B)"]
+        C1 --> C3
+        C2 --> C3
     end
 
-    BOTH --> PA & PB
+    subgraph "4. Report + Store"
+        R1["Markdown report"]
+        R2["JSON summary"]
+        R3["Upload to GCS/S3<br/>(nightly/release)"]
+        C3 --> R1 & R2 --> R3
+    end
+
+    S5 --> B1 & B2 & B3
+    B1 & B2 & B3 --> C1 & C2
 ```
 
 ---
 
 ## 8. Metrics and Data Collection
 
-### 8.1. Primary LLM Inference Metrics
+### 8.1. Primary LLM Metrics (from `inference-perf`)
 
-These match the upstream GIE benchmark format:
+| Metric | Full Name | What it measures |
+|--------|-----------|-----------------|
+| **TPOT** | Time Per Output Token | Avg time between generated tokens — EPP scheduling cost |
+| **ITL** | Inter-Token Latency | Latency between consecutive streaming tokens |
+| **TTFT** | Time to First Token | Time to first response token — includes EPP round-trip + prefill |
+| **E2E latency** | End-to-end (p50/p95/p99) | Total request duration |
+| **Throughput** | Tokens/sec + Requests/sec | System capacity |
+| **Error rate** | Failed request % | Stability under load |
 
-| Metric | Full Name | Description | Source |
-|--------|-----------|-------------|--------|
-| **TPOT** | Time Per Output Token | Average time between generated tokens | `inference-perf` |
-| **ITL** | Inter-Token Latency | Latency between consecutive tokens in a stream | `inference-perf` |
-| **TTFT** | Time to First Token | Time from request to first response token | `inference-perf` |
-| **E2E latency** | End-to-end latency (p50/p95/p99) | Total request duration | `inference-perf` |
-| **Throughput** | Tokens/sec and Requests/sec | System capacity | `inference-perf` |
-| **Error rate** | Failed requests % | Stability under load | `inference-perf` |
+### 8.2. Resource Overhead Metrics (from Prometheus + cAdvisor)
 
-### 8.2. Resource Overhead Metrics
+| Metric | Target Components |
+|--------|------------------|
+| CPU milliseconds | Envoy proxy, EPP, BBR, kgateway controller |
+| Memory bytes | Envoy proxy, EPP, BBR |
+| IGW vs k8s svc delta | Overhead attributable to inference routing |
 
-| Metric | Target | Source |
-|--------|--------|--------|
-| **CPU usage** | Envoy proxy, EPP, BBR, kgateway controller | Prometheus + cAdvisor |
-| **Memory usage** | Envoy proxy, EPP, BBR | Prometheus + cAdvisor |
-| **IGW vs k8s delta** | CPU/memory overhead of inference routing | Calculated |
+### 8.3. Envoy ext_proc Metrics
 
-### 8.3. Envoy / EPP-Specific Metrics
-
-| Metric | Source |
-|--------|--------|
-| `envoy_ext_proc_streams_started` | Envoy admin stats |
-| `envoy_ext_proc_streams_msgs_sent` | Envoy admin stats |
-| `envoy_http_downstream_rq_time_bucket` | Envoy histograms (routing latency) |
-| `envoy_cluster_upstream_rq_time_bucket` | Envoy histograms (EPP call latency) |
+| Metric | What it reveals |
+|--------|----------------|
+| `envoy_ext_proc_streams_started` | Total EPP calls |
+| `envoy_ext_proc_streams_msgs_sent` | gRPC message volume |
+| `envoy_http_downstream_rq_time_bucket` | End-to-end Envoy routing latency |
+| `envoy_cluster_upstream_rq_time_bucket` | Upstream (model server) response latency |
 
 ### 8.4. Report Format
 
@@ -485,32 +408,15 @@ These match the upstream GIE benchmark format:
 {
   "timestamp": "2026-04-01T00:00:00Z",
   "kgateway_version": "v2.3.0",
-  "model": "llama2-7b",
-  "scenarios": {
-    "igw": {
-      "tpot_ms": 12.4,
-      "itl_ms": 11.8,
-      "ttft_ms": 45.2,
-      "e2e_p50_ms": 1240,
-      "e2e_p99_ms": 3100,
-      "throughput_tokens_per_sec": 810,
-      "error_rate": 0.001
-    },
-    "k8s_service": {
-      "tpot_ms": 12.1,
-      "itl_ms": 11.5,
-      "ttft_ms": 28.3,
-      "e2e_p50_ms": 1210,
-      "e2e_p99_ms": 2950,
-      "throughput_tokens_per_sec": 840,
-      "error_rate": 0.001
-    }
+  "config": "prefix-cache-aware",
+  "model_server": "llm-d-inference-sim",
+  "replicas": 3,
+  "results": {
+    "igw": { "tpot_ms": 12.4, "itl_ms": 11.8, "ttft_ms": 45.2, "e2e_p99_ms": 3100, "throughput_tps": 810 },
+    "k8s_svc": { "tpot_ms": 12.1, "itl_ms": 11.5, "ttft_ms": 28.3, "e2e_p99_ms": 2950, "throughput_tps": 840 }
   },
-  "overhead": {
-    "ttft_delta_ms": 16.9,
-    "epp_cpu_millicores": 145,
-    "epp_memory_mb": 92
-  }
+  "overhead": { "ttft_delta_ms": 16.9, "epp_cpu_millicores": 145, "epp_memory_mb": 92 },
+  "regression": { "lpg_passed": true, "baseline_ttft_ms": 44.1, "delta_pct": 2.5 }
 }
 ```
 
@@ -522,62 +428,51 @@ These match the upstream GIE benchmark format:
 
 ```mermaid
 flowchart TD
-    subgraph "Trigger"
-        NT["Nightly<br/>(2 AM UTC)"]
-        RL["Release Tag"]
-        WD["Manual Dispatch"]
-        PR["PR with 'benchmark' label"]
+    subgraph "Triggers"
+        NT["Nightly Schedule"] & RL["Release Tag"] & WD["Manual Dispatch"] & PR["PR + 'benchmark' label"]
     end
 
-    subgraph "GitHub Actions"
-        SC["Setup Kind cluster<br/>+ kgateway + GIE"]
+    subgraph "GitHub Actions Job"
+        SC["Setup cluster + kgateway"]
         DS["Deploy llm-d-sim + EPP"]
-        RB["Run inference-perf<br/>(both scenarios)"]
-        CR["Collect + compare results"]
+        LR["Run LPG (regression)"]
+        BR["Run inference-perf<br/>(all 4 configs × 2 scenarios)"]
+        CO["Collect + compare results"]
         UP["Upload artifacts<br/>(JSON + Markdown)"]
-        CMT["Comment on PR<br/>(if PR trigger)"]
+        GU["Upload to GCS/S3<br/>(nightly + release only)"]
     end
 
-    subgraph "Pass/Fail"
-        TH{"Regressions<br/>detected?"}
+    subgraph "Result"
+        TH{"Regression<br/>detected?"}
         PASS["✓ PASS"]
-        FAIL["✗ FAIL (block release)"]
+        FAIL["✗ FAIL"]
     end
 
-    NT & RL & WD & PR --> SC --> DS --> RB --> CR --> UP --> TH
+    NT & RL & WD & PR --> SC --> DS --> LR & BR --> CO --> UP --> TH
+    CO -.->|"nightly/release"| GU
     TH -->|"No"| PASS
     TH -->|"Yes"| FAIL
-    CR --> CMT
 ```
 
-### 9.2. Makefile Targets
+### 9.2. Workflow Files
+
+| File | Trigger | Description |
+|------|---------|-------------|
+| `.github/workflows/benchmark-nightly.yaml` | Nightly cron | Full benchmark suite against `main` |
+| `.github/workflows/benchmark-release.yaml` | Release tag | Full suite + GCS upload |
+| `.github/workflows/benchmark-regression.yaml` | PR (label-gated) | LPG regression test only (fast) |
+
+### 9.3. Makefile Targets
 
 ```makefile
 .PHONY: benchmark
-benchmark: ## Run all inference routing benchmarks (IGW vs k8s-svc)
-	cd test/benchmark && $(MAKE) run-all
-
-.PHONY: benchmark-setup
-benchmark-setup: ## Set up benchmark environment (cluster + dependencies)
-	bash test/benchmark/setup/kind-cluster.sh
-	bash test/benchmark/setup/install-kgateway.sh
-	bash test/benchmark/setup/install-inference-perf.sh
-
-.PHONY: benchmark-igw
-benchmark-igw: ## Run inference gateway (IGW) scenario only
-	cd test/benchmark && $(MAKE) run-igw
-
-.PHONY: benchmark-k8s-svc
-benchmark-k8s-svc: ## Run plain k8s service scenario only
-	cd test/benchmark && $(MAKE) run-k8s-svc
-
-.PHONY: benchmark-report
-benchmark-report: ## Generate report from latest results
-	cd test/benchmark && $(MAKE) report
-
-.PHONY: benchmark-compare
-benchmark-compare: ## Compare latest vs committed baseline (regression check)
-	cd test/benchmark && $(MAKE) compare
+benchmark:           ## Run full benchmark suite (IGW vs k8s-svc, all configs)
+benchmark-setup:     ## Set up benchmark environment (cluster + dependencies)
+benchmark-igw:       ## Run inference gateway scenarios only
+benchmark-k8s-svc:   ## Run k8s service baseline only
+benchmark-regression:## Run LPG regression test only
+benchmark-report:    ## Generate report from latest results
+benchmark-compare:   ## Compare latest vs committed baseline
 ```
 
 ---
@@ -586,134 +481,119 @@ benchmark-compare: ## Compare latest vs committed baseline (regression check)
 
 | Document | Location | Description |
 |----------|----------|-------------|
-| **Benchmark README** | `test/benchmark/README.md` | Quick start: run in 5 minutes |
-| **Methodology** | `test/benchmark/docs/methodology.md` | Scenario rationale, assumptions, limitations |
-| **Interpreting Results** | `test/benchmark/docs/interpreting-results.md` | What TPOT/ITL/TTFT mean, how to read the report |
-| **Reproducing Benchmarks** | `test/benchmark/docs/reproducing.md` | Step-by-step guide for users to reproduce locally |
-| **Best Practices** | `test/benchmark/docs/best-practices.md` | EPP tuning, InferencePool sizing, perf tips |
-| **Design Document** | `design/XXXX-inference-routing-benchmarks.md` | Formal EP following kgateway template |
+| **README** | `test/benchmark/README.md` | Quick start: run in one command |
+| **Methodology** | `test/benchmark/docs/methodology.md` | Config rationale, assumptions, what we don't test |
+| **Interpreting Results** | `test/benchmark/docs/interpreting-results.md` | What TPOT/ITL/TTFT mean, how to read the JSON report |
+| **Reproducing Benchmarks** | `test/benchmark/docs/reproducing.md` | Step-by-step guide for users to validate results |
+| **Best Practices** | `test/benchmark/docs/best-practices.md` | EPP tuning, InferencePool sizing, scaling tips |
+| **Design Document** | `design/XXXX-inference-routing-benchmarks.md` | Formal EP following kgateway EP template |
 
 ---
 
 ## 11. Timeline and Milestones
 
-### 6-Week GSoC Timeline
-
 ```mermaid
 gantt
-    title Inference Routing Benchmark Framework (6 Weeks)
+    title Inference Routing Benchmark Framework — 6 Weeks
     dateFormat YYYY-MM-DD
     axisFormat %b %d
 
     section Week 1: Foundation
-    Design doc + review                    :des, 2026-05-01, 5d
-    Setup scripts (cluster + kgateway)     :setup, 2026-05-03, 4d
+    Design doc + maintainer review     :des,   2026-05-01, 5d
+    Cluster setup scripts              :setup, 2026-05-03, 4d
 
     section Week 2: Core Integration
-    inference-perf integration + config    :ip, 2026-05-08, 5d
-    llm-d-inference-sim deployment         :sim, 2026-05-10, 3d
+    inference-perf + standard config   :ip,    2026-05-08, 5d
+    llm-d-sim deployment + EPP wiring  :sim,   2026-05-10, 3d
 
-    section Week 3: Scenarios
-    IGW vs k8s-svc comparison             :cmp, 2026-05-15, 5d
-    EPP configuration variations           :epp, 2026-05-18, 3d
+    section Week 3: All 4 Configurations
+    Prefix cache + decode/prefill heavy :cfg,  2026-05-15, 4d
+    Multi-LoRA configuration           :lora,  2026-05-18, 3d
 
-    section Week 4: Harness + Reporting
-    Go test harness                        :har, 2026-05-22, 5d
-    Results processor + Markdown report    :rpt, 2026-05-25, 3d
+    section Week 4: LPG + Harness
+    LPG regression setup               :lpg,   2026-05-22, 3d
+    Go test harness + results/reports  :har,   2026-05-22, 5d
 
-    section Week 5: CI + Automation
-    GitHub Actions nightly workflow        :ci, 2026-05-29, 4d
-    Regression detection + baselines       :reg, 2026-06-01, 3d
+    section Week 5: CI + Storage
+    GitHub Actions workflows           :ci,    2026-05-29, 4d
+    GCS/S3 result upload               :store, 2026-06-01, 3d
 
     section Week 6: Docs + Polish
-    Documentation                          :doc, 2026-06-05, 4d
-    Final review + PR                      :rev, 2026-06-08, 3d
+    Documentation                      :doc,   2026-06-05, 4d
+    Final PR + review                  :rev,   2026-06-08, 3d
 ```
-
-### Milestone Deliverables
 
 | Week | Milestone | Deliverables |
 |------|-----------|-------------|
-| **1** | Foundation | Design doc approved, cluster setup scripts |
-| **2** | Core Integration | `inference-perf` running against kgateway, `llm-d-sim` deployed |
-| **3** | Scenarios | IGW vs k8s-svc results, EPP config variations |
-| **4** | Harness | Go test harness, Markdown + JSON report generation |
-| **5** | CI | Nightly CI workflow, regression detection |
-| **6** | Polish | Full documentation, final PR |
+| **1** | Foundation | Design doc approved, cluster setup scripts working |
+| **2** | Core integration | `inference-perf` running standard IGW vs k8s-svc comparison |
+| **3** | All configs | Prefix cache, decode heavy, prefill heavy, multi-LoRA scenarios |
+| **4** | Regression + harness | LPG regression test, Go harness, Markdown/JSON reports |
+| **5** | CI + storage | Nightly workflow, GCS/S3 upload, artifact storage |
+| **6** | Polish | Full docs, final PR |
 
 ---
 
 ## 12. TODO Checklist
 
 ### Phase 1: Foundation (Week 1)
-
-- [ ] Write formal design document (`design/XXXX-inference-routing-benchmarks.md`)
+- [ ] Write `design/XXXX-inference-routing-benchmarks.md` following EP template
 - [ ] Get design doc reviewed by maintainers
-- [ ] Write `test/benchmark/setup/kind-cluster.sh` (reproducible Kind cluster)
-- [ ] Write `test/benchmark/setup/install-kgateway.sh` (with inference extension enabled)
+- [ ] Write `test/benchmark/setup/cluster-kind.sh`
+- [ ] Write `test/benchmark/setup/install-kgateway.sh` (inference extension enabled)
 - [ ] Write `test/benchmark/setup/install-inference-perf.sh`
-- [ ] Create baseline Kubernetes manifests (Gateway, HTTPRoute, Service, InferencePool, InferenceModel)
+- [ ] Create base Kubernetes manifests (Gateway, HTTPRoute, InferencePool, InferenceModel)
 
 ### Phase 2: Core Integration (Week 2)
+- [ ] Deploy `llm-d-inference-sim` × 3 replicas with vLLM-compatible metrics
+- [ ] Deploy EPP targeting `llm-d-sim` pods
+- [ ] Write `inference-perf/config-standard.yaml` (IGW vs k8s-svc)
+- [ ] Validate end-to-end: requests → Envoy → EPP → llm-d-sim
+- [ ] Capture initial TPOT/ITL/TTFT output from `inference-perf`
 
-- [ ] Deploy `llm-d/llm-d-inference-sim` with vLLM-compatible metrics
-- [ ] Deploy EPP configured to scrape `llm-d-sim` metrics
-- [ ] Write `inference-perf/config-igw.yaml` (IGW scenario config)
-- [ ] Write `inference-perf/config-k8s-svc.yaml` (k8s service scenario config)
-- [ ] Validate end-to-end: requests flow through kgateway → EPP → llm-d-sim
+### Phase 3: All 4 Configurations (Week 3)
+- [ ] Write `inference-perf/config-prefix-cache.yaml`
+- [ ] Write `inference-perf/config-decode-heavy.yaml`
+- [ ] Write `inference-perf/config-prefill-heavy.yaml`
+- [ ] Write `inference-perf/config-multilora.yaml` (2-4 LoRA adapters)
+- [ ] Validate all 4 configs produce valid result JSON
 
-### Phase 3: Benchmark Scenarios (Week 3)
+### Phase 4: LPG + Harness (Week 4)
+- [ ] Set up Latency Profile Generator (`lpg/config-regression.yaml`)
+- [ ] Commit initial latency baseline profile (`lpg/profiles/baseline-profile.json`)
+- [ ] Implement Go test harness (`setup.go`, `teardown.go`, `benchmark_test.go`)
+- [ ] Implement results collector (`results.go`) — parse inference-perf JSON + Prometheus
+- [ ] Implement Markdown + JSON report generator (`report.go`)
+- [ ] Commit benchmark baseline (`results/baseline/benchmark-results.json`)
 
-- [ ] Run IGW vs k8s-svc comparison and record raw results
-- [ ] Write `inference-perf/config-multilora.yaml` (LoRA-aware scheduling)
-- [ ] Write `inference-perf/config-streaming.yaml` (TTFT / ITL focus)
-- [ ] Test EPP + BBR configuration variant
-- [ ] Validate TPOT, ITL, TTFT metric output from `inference-perf`
-
-### Phase 4: Harness and Reporting (Week 4)
-
-- [ ] Implement Go test harness (`harness/benchmark_test.go`, `setup.go`, `teardown.go`)
-- [ ] Implement results collection (`harness/results.go`) — parse inference-perf JSON + Prometheus
-- [ ] Implement Markdown report generator (`harness/report.go`)
-- [ ] Commit baseline results (`results/baseline/benchmark-results.json`)
-- [ ] Add `make benchmark-compare` regression detection
-
-### Phase 5: CI Automation (Week 5)
-
-- [ ] Create `.github/workflows/benchmark.yaml`
-  - [ ] Nightly schedule trigger
-  - [ ] Release tag trigger
-  - [ ] Manual dispatch trigger
-  - [ ] PR label-gated trigger
-- [ ] Upload JSON + Markdown results as workflow artifacts
-- [ ] Post PR comment with benchmark summary
-- [ ] Add `make benchmark-*` targets to root Makefile
+### Phase 5: CI + Storage (Week 5)
+- [ ] Create `.github/workflows/benchmark-nightly.yaml`
+- [ ] Create `.github/workflows/benchmark-regression.yaml` (PR-level LPG only)
+- [ ] Implement GCS upload (`storage.go`) for nightly + release runs
+- [ ] Add Makefile targets to root `Makefile`
+- [ ] Test full nightly workflow end-to-end
 
 ### Phase 6: Documentation (Week 6)
-
-- [ ] Write `test/benchmark/README.md` (quick start)
+- [ ] Write `test/benchmark/README.md`
 - [ ] Write `test/benchmark/docs/methodology.md`
 - [ ] Write `test/benchmark/docs/interpreting-results.md`
 - [ ] Write `test/benchmark/docs/reproducing.md`
 - [ ] Write `test/benchmark/docs/best-practices.md`
-- [ ] Final PR review and merge
+- [ ] Final PR review + merge
 
 ### Stretch Goals (Post-GSoC)
-
-- [ ] **S1**: Provision B100 GPU environment on GCP/Azure/AWS
-- [ ] **S2**: Publish benchmark results page on kgateway website
-- [ ] **S3**: Gate releases on inference perf regressions (integrate into release workflow)
-- [ ] **S4**: Cross-reference with `llm-d` benchmark results
-- [ ] **S5**: GPU utilization metrics (await `inference-perf` roadmap)
+- [ ] **S1**: Provision B100/H100 80GB GPU env (GKE) with 8-10 vLLM replicas
+- [ ] **S2**: Add `cluster-gke.sh` + `.github/workflows/benchmark-e2e-gke.yaml`
+- [ ] **S3**: Publish benchmark results page on kgateway website
+- [ ] **S4**: Gate releases on inference perf regressions
+- [ ] **S5**: Cross-reference with llm-d benchmark results
 
 ---
 
-## User Review Required
-
 > [!IMPORTANT]
-> **Questions for the contributor before starting:**
-> 1. Do you have (or can you request) cloud GPU quota for the Stretch Goal S1 (B100 GPU environment)?
-> 2. Should the design document follow kgateway's existing EP template (`design/template.md`)?
-> 3. For CI, should we start with nightly-only or also add a weekly "heavier" run with more load scenarios?
-> 4. Do you have access to the kgateway website repo to eventually publish benchmark results (Stretch Goal S2)?
-> 5. Is `llm-d-inference-sim` acceptable as the model server dependency, or would the maintainers prefer the simpler GIE vLLM simulator for less external coupling?
+> **Open questions for maintainers:**
+> 1. Is there existing cloud budget / OSS GPU credits for running H100/B100 benchmarks (Stretch Goal S1)?
+> 2. Should the design document follow the existing EP template at `design/`?
+> 3. Is `llm-d-inference-sim` an acceptable dependency, or should we use the simpler GIE-provided vLLM stub?
+> 4. For CI regression gating (Stretch Goal S4), what is an acceptable latency regression threshold (e.g., p99 TTFT increase of >10%)?
+> 5. Where should long-term benchmark results be stored — GCS bucket maintained by the project, or GitHub Actions artifacts only?
