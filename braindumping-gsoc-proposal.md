@@ -199,7 +199,37 @@ flowchart LR
 
 This happens **before any requests arrive**. The ext_proc filter telling Envoy to send requests to the EPP is part of this translation. At request time, Envoy already has the configuration.
 
----
+### inference-perf
+
+It's a benchmarking tool specifically for LLM inference workloads, built by the Kubernetes community.
+
+```
+Regular load tester (k6, vegeta, fortio) + LLM-specific metrics (TTFT, TPOT, ITL) + Kubernetes/gateway awareness = inference-perf
+```
+
+This makes things a lot easier for us, we dont have to use multiple tools for load generation, metrics exposing, benchmarking etc. now. 
+
+What it does:
+
+1. Takes a dataset of real LLM prompts
+2. Sends them to your gateway endpoint at configurable rates
+3. Measures per-request: TTFT, TPOT, ITL, Total generation time, Token counts.
+
+the upstream GIE project already uses this, we just need a similar implementation specific to kgateway.
+
+How the upstream GIE project uses it:
+
+```
+Real prompts dataset                                      
+        ↓                                                 
+inference-perf                                            
+        ↓                                                 
+Gateway (with GIE)                                        
+        ↓                                                 
+vLLM on GPU                                              
+        ↓                                                 
+Results (they published them on their website)
+```
 
 ### The Need for Smarter Routing
 
@@ -309,13 +339,7 @@ The EPP reads these to decide where to send the next request. Our mock server mu
 
 ---
 
-### Load Generation (k6) (yet to decide which one to use
-
-k6 is a load testing tool built by Grafana Labs. It is:
-- **Scripted in JavaScript** — easy to write complex request logic (build JSON body, parse SSE responses)
-- **A single binary** — easy to install in CI; no runtime dependencies
-- **Built for HTTP benchmarking** — first-class support for all the metrics we need
-- **Extensible** — can push results to Prometheus via an official extension (xk6-output-prometheus-remote-write)
+### Load Generation
 
 We run a **ramp-up profile** (not constant load) because:
 - Ramp-up reveals the **hockey stick** — at what RPS does latency start exploding?
