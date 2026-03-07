@@ -247,6 +247,55 @@ compares against stored baseline
 pass or fail
 ```
 
+### Prefill and Decode
+
+Prefill is Processing the input prompt and Decode is Generating output tokens one by one.
+
+```
+User sends: "What is the capital of France?"
+
+Prefill:
+→ Model reads and processes the entire input prompt at once
+→ This is what TTFT measures
+
+Decode:
+→ Model generates output tokens ONE BY ONE
+→ Each token depends on the previous one
+→ Happens repeatedly until response is complete
+→ This is what TPOT/ITL measures
+```
+
+Some more terms you need to know, these are the senarios that GIE proj is also using as test cases, we will also benchmark for these cases:
+
+- Prefix Cache Aware: When the model processes a prompt during prefill, it generates intermediate computations called Key-Value (KV) cache. If the same prompt prefix appears again, the model can reuse those computations instead of redoing them.
+
+- Decode Heavy: Short input, very long output.
+
+```
+Input:  "Write me a detailed essay about climate change"
+        (~50 tokens, quick prefill)
+        ↓
+Output: [500+ tokens of essay content]
+```
+
+- Prefill Heavy: Long input, short output - opposite of decode heavy.
+
+- Multi-LoRA: This scenario just tests it at scale: Same pool of pods, multiple adapters:
+
+```
+Pod 1: base model + Medical LoRA loaded
+Pod 2: base model + Legal LoRA loaded  
+Pod 3: base model + Customer Service LoRA loaded
+Pod 4: base model + Medical LoRA loaded
+Mixed traffic comes in simultaneously:
+Request 1: model="medical-llm"     → must go to Pod 1 or 4
+Request 2: model="legal-llm"       → must go to Pod 2
+Request 3: model="cs-llm"          → must go to Pod 3
+Request 4: model="medical-llm"     → must go to Pod 1 or 4
+```
+
+NOTE: here we can also measure Routing accuracy. Did requests land on pods with correct adapter?
+
 ### The Need for Smarter Routing
 
 Regular load balancers use simple strategies: round-robin, least-connections, random. These work fine for stateless web servers because all backends are equivalent.
