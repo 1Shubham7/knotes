@@ -231,6 +231,22 @@ vLLM on GPU
 Results (they published them on their website)
 ```
 
+### Regression Testing
+
+Apart from inference-pref for benchmarking we will also do regression testing. Regression testing is basically testing done to make sure that new code changes did not break existing functionality.
+
+So while we have a main benchmarking job (that will be done by inference-pref), we will also run regression testing againt a baseline that we store in some file. confirm that this is needed from maintainers.
+
+```
+Latency Profile Generator
+      ↓
+runs against Inference Gateway only
+      ↓
+compares against stored baseline
+      ↓
+pass or fail
+```
+
 ### The Need for Smarter Routing
 
 Regular load balancers use simple strategies: round-robin, least-connections, random. These work fine for stateless web servers because all backends are equivalent.
